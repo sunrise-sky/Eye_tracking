@@ -1,0 +1,293 @@
+/*
+ * @Filename: demo_face.cpp
+ * @Description: Pupil Tracker - using SSNE API
+ */
+#include <stdio.h>
+#include <unistd.h>
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <queue>
+#include <vector>
+#include <cstdlib>
+#include <ctime>
+#include "smartsoc/ssne_api.h"
+#include "smartsoc/osd_lib_api.h"
+#include "common.hpp"
+
+using namespace std;
+using namespace fdevice;
+
+// ========== 全局变量 ==========
+std::mutex mtx_image;
+std::condition_variable cv_image_ready;
+std::atomic<bool> stop_inference(false);
+
+struct ImagePair {
+    ssne_tensor_t img1;
+    ssne_tensor_t img2;
+    int frame_id;
+};
+std::queue<ImagePair> image_queue;
+const int MAX_QUEUE_SIZE = 2;
+
+bool g_exit_flag = false;
+std::mutex g_mtx;
+
+static uint16_t g_model_id = 0;
+
+// OSD 句柄
+static handle_t g_osd_handle = 0;
+static LAYER_HANDLE g_osd_layer_id = 0;
+
+static const int IMG_W = 640;
+static const int IMG_H = 480;
+static const int OFFSET_Y = IMG_H;
+
+// 平滑缓冲区
+static float left_x_buf[5] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+static float left_y_buf[5] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+static float right_x_buf[5] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+static float right_y_buf[5] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+static int buf_idx = 0;
+
+// ========== 键盘监听 ==========
+void keyboard_listener() {
+    string input;
+    cout << "按 'q' 退出" << endl;
+    while (true) {
+        cin >> input;
+        lock_guard<mutex> lock(g_mtx);
+        if (input == "q" || input == "Q") {
+            g_exit_flag = true;
+            break;
+        }
+    }
+}
+
+bool check_exit_flag() {
+    lock_guard<mutex> lock(g_mtx);
+    return g_exit_flag;
+}
+
+// ========== OSD 绘制 ==========
+void osd_draw_rect(int x, int y, int w, int h, int color, int line_width) {
+    if (g_osd_handle == 0 || g_osd_layer_id == 0) return;
+    
+    QUADRANGLE_S quad;
+    quad.top_left.x = x;
+    quad.top_left.y = y;
+    quad.top_right.x = x + w;
+    quad.top_right.y = y;
+    quad.bottom_left.x = x;
+    quad.bottom_left.y = y + h;
+    quad.bottom_right.x = x + w;
+    quad.bottom_right.y = y + h;
+    
+    osd_add_quadrangle(g_osd_layer_id, &quad, color, line_width, ALPHATYPE_OP);
+    osd_flush_quadrangle(g_osd_layer_id);
+}
+
+// ========== 推理线程 ==========
+void inference_thread_func() {
+    cout << "[Thread] Inference started" << endl;
+    
+    int eye_w = IMG_W / 2;
+    int eye_h = IMG_H / 3;
+    
+    while (!stop_inference) {
+        ImagePair img_pair;
+        bool has_image = false;
+        
+        {
+            unique_lock<mutex> lock(mtx_image);
+            cv_image_ready.wait(lock, [] {
+                return !image_queue.empty() || stop_inference;
+            });
+            if (stop_inference && image_queue.empty()) break;
+            if (!image_queue.empty()) {
+                img_pair = image_queue.front();
+                image_queue.pop();
+                has_image = true;
+            }
+        }
+        
+        if (!has_image) continue;
+        
+        // 模拟瞳孔坐标
+        static float sim_x = 0.5f, sim_y = 0.5f;
+        sim_x += (rand() % 100 - 50) / 5000.0f;
+        sim_y += (rand() % 100 - 50) / 5000.0f;
+        if (sim_x < 0.1f) sim_x = 0.1f;
+        if (sim_x > 0.9f) sim_x = 0.9f;
+        if (sim_y < 0.1f) sim_y = 0.1f;
+        if (sim_y > 0.9f) sim_y = 0.9f;
+        
+        // 平滑
+        left_x_buf[buf_idx] = sim_x;
+        left_y_buf[buf_idx] = sim_y;
+        right_x_buf[buf_idx] = sim_x;
+        right_y_buf[buf_idx] = sim_y;
+        buf_idx = (buf_idx + 1) % 5;
+        
+        float left_x = 0, left_y = 0, right_x = 0, right_y = 0;
+        for (int i = 0; i < 5; i++) {
+            left_x += left_x_buf[i];
+            left_y += left_y_buf[i];
+            right_x += right_x_buf[i];
+            right_y += right_y_buf[i];
+        }
+        left_x /= 5; left_y /= 5; right_x /= 5; right_y /= 5;
+        
+        float left_px = left_x * eye_w;
+        float left_py = left_y * eye_h;
+        float right_px = eye_w + right_x * eye_w;
+        float right_py = right_y * eye_h;
+        
+        // 绘制瞳孔框
+        osd_draw_rect(left_px - 15, left_py - 15, 30, 30, 0x00FF00, 2);
+        osd_draw_rect(right_px - 15, right_py - 15 + OFFSET_Y, 30, 30, 0x00FF00, 2);
+        
+        static int cnt = 0;
+        if (cnt++ % 30 == 0) {
+            printf("L(%.1f,%.1f) R(%.1f,%.1f)\n", left_px, left_py, right_px, right_py);
+        }
+    }
+    
+    cout << "[Thread] Inference stopped" << endl;
+}
+
+int main() {
+    cout << "=== Pupil Tracker Demo ===" << endl;
+    cout << "Controls: 'q'=quit" << endl;
+    
+    srand(time(NULL));
+    
+    int img_width = 640;
+    int img_height = 480;
+    string model_path = "/app_demo/app_assets/models/pupil_gap.m1model";
+    
+    // 1. 初始化 SSNE
+    if (ssne_initial() != 0) {
+        cerr << "SSNE init failed" << endl;
+        return -1;
+    }
+    cout << "SSNE initialized" << endl;
+    
+    // 2. 加载模型
+    char* ssmodel = const_cast<char*>(model_path.c_str());
+    g_model_id = ssne_loadmodel(ssmodel, SSNE_STATIC_ALLOC);
+    if (g_model_id < 0) {
+        cerr << "Model load failed" << endl;
+        ssne_release();
+        return -1;
+    }
+    cout << "Model loaded, id=" << g_model_id << endl;
+    
+    // 3. 初始化 OSD
+    g_osd_handle = osd_open_device();
+    if (g_osd_handle != 0) {
+        // 初始化 OSD 设备（需要传入 LUT 文件路径）
+        osd_init_device(g_osd_handle, 5, "/app_demo/app_assets/colorLUT.sscl");
+        
+        // 分配 DMA 缓冲区
+        void* buffer_handle = nullptr;
+        osd_alloc_buffer(g_osd_handle, buffer_handle, img_width * img_height * 2);
+        
+        // 创建图层
+        g_osd_layer_id = 0;
+        LAYER_ATTR_S layer_attr;
+        layer_attr.codeTYPE = SS_TYPE_QUADRANGLE;
+        layer_attr.layerStart.layer_start_x = 0;
+        layer_attr.layerStart.layer_start_y = 0;
+        layer_attr.layerSize.layer_width = img_width;
+        layer_attr.layerSize.layer_height = img_height * 2;
+        osd_create_layer(g_osd_handle, g_osd_layer_id, &layer_attr);
+        
+        DMA_BUFFER_ATTR_S dma_attr;
+        dma_attr.dma = buffer_handle;
+        osd_set_layer_buffer(g_osd_handle, g_osd_layer_id, dma_attr);
+        
+        cout << "OSD initialized" << endl;
+    }
+    
+    // 4. 初始化图像处理器
+    array<int, 2> img_shape = {img_width, img_height};
+    IMAGEPROCESSOR processor;
+    processor.Initialize(&img_shape);
+    
+    thread inference_thread(inference_thread_func);
+    thread listener_thread(keyboard_listener);
+    
+    // 5. ISP Debug
+    ssne_tensor_t img_sensor[2];
+    ssne_tensor_t output_sensor[2];
+    output_sensor[0] = create_tensor(img_width, img_height * 2, SSNE_Y_8, SSNE_BUF_AI);
+    output_sensor[1] = create_tensor(img_width, img_height * 2, SSNE_Y_8, SSNE_BUF_AI);
+    
+    processor.GetDualImage(&img_sensor[0], &img_sensor[1]);
+    copy_double_tensor_buffer(img_sensor[0], img_sensor[1], output_sensor[0]);
+    copy_double_tensor_buffer(img_sensor[0], img_sensor[1], output_sensor[1]);
+    
+    set_isp_debug_config(output_sensor[0], output_sensor[1]);
+    
+    uint16_t num_frames = 0;
+    while (num_frames < 2) {
+        start_isp_debug_load();
+        num_frames++;
+    }
+    
+    uint8_t load_flag = 0;
+    while (!check_exit_flag()) {
+        processor.GetDualImage(&img_sensor[0], &img_sensor[1]);
+        get_even_or_odd_flag(load_flag);
+        
+        if (load_flag == 0) {
+            copy_double_tensor_buffer(img_sensor[0], img_sensor[1], output_sensor[0]);
+        } else {
+            copy_double_tensor_buffer(img_sensor[0], img_sensor[1], output_sensor[1]);
+        }
+        
+        start_isp_debug_load();
+        
+        {
+            unique_lock<mutex> lock(mtx_image);
+            if (image_queue.size() < MAX_QUEUE_SIZE) {
+                ImagePair img_pair;
+                img_pair.img1 = img_sensor[0];
+                img_pair.img2 = img_sensor[1];
+                img_pair.frame_id = num_frames;
+                image_queue.push(img_pair);
+                cv_image_ready.notify_one();
+            }
+        }
+        
+        num_frames++;
+    }
+    
+    // 清理
+    cout << "Cleaning up..." << endl;
+    {
+        unique_lock<mutex> lock(mtx_image);
+        stop_inference = true;
+        cv_image_ready.notify_one();
+    }
+    
+    if (listener_thread.joinable()) listener_thread.join();
+    if (inference_thread.joinable()) inference_thread.join();
+    
+    processor.Release();
+    
+    if (g_osd_handle != 0) {
+        osd_destroy_layer(g_osd_handle, g_osd_layer_id);
+        osd_delete_buffer(g_osd_handle);
+        osd_close_device(g_osd_handle);
+    }
+    
+    ssne_release();
+    
+    cout << "Demo exited" << endl;
+    return 0;
+}
