@@ -74,7 +74,7 @@ void OsdDevice::Release(){
     }
 
     if(m_pcolor_lut != nullptr){
-        delete m_pcolor_lut;
+        delete[] m_pcolor_lut;
         m_pcolor_lut = nullptr;
     }
 
@@ -120,18 +120,14 @@ void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle){
 void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle, int layer_id){
     if ((quad_rangle.size() == 0)){
         osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
-        printf("Draw --- osd_clean_layer\n");
         return;
     }
-    int ret = 0;
 
     // generate qrangle box
     for(auto &q : quad_rangle){
-        printf("Draw --- q.box: %f, %f, %f, %f\n", q.box[0], q.box[1], q.box[2], q.box[3]);
         GenQrangleBox(q.box, q.border);
         COVER_ATTR_S qrangle_attr = {q.color, q.type, q.alpha, m_qrangle_out, m_qrangle_in};
-        ret = osd_add_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &qrangle_attr);   
-        printf("Draw --- osd_add_quad_rangle_layer ret: %d\n", ret);
+        osd_add_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &qrangle_attr);
     }
     
     // flush data to ddr

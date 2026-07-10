@@ -20,8 +20,6 @@ void VISUALIZER::Draw() {
 }
 
 void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
-    printf("Drawing %zu detection boxes
-", boxes.size());
     std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
     for (size_t i = 0; i < boxes.size(); i++) {
         sst::device::osd::OsdQuadRangle q;

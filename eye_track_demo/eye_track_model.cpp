@@ -1,6 +1,6 @@
 /*
- * @Filename: eye_track.cpp
- * @Description: Pupil tracking + gaze estimation on A1 dual sensor
+ * @Filename: eye_track_model.cpp
+ * @Description: Pupil tracking + optional pupil_gap model fallback
  * @Date: 2026-04-26
  */
 #include <fstream>
@@ -20,6 +20,7 @@
 #include <numeric>
 #include <cmath>
 #include <vector>
+#include <cstdlib>
 #include "include/utils.hpp"
 
 using namespace std;
@@ -80,12 +81,14 @@ bool FindPupilClassic(const uint8_t* gray, int stride, int w, int h,
 
 class PupilDetector {
 public:
-    void Initialize(int w, int h) {
+    void Initialize(int w, int h, const std::string& model_path,
+                    bool enable_model=true) {
         img_w_=w; img_h_=h;
         linux_tensor_=create_tensor(w,h,SSNE_Y_8,SSNE_BUF_LINUX);
         buf_size_=w*h;
         img_buf_=new uint8_t[buf_size_];
-        printf("[PupilDetector] Initialized (classic mode)\n");
+        printf("[PupilDetector] classic mode ready\n");
+        if(enable_model) TryInitializeModel(model_path);
     }
     bool PrepareFrame(ssne_tensor_t* img) {
         if(!img) return false;
@@ -94,16 +97,17 @@ public:
         return true;
     }
     bool Detect(const std::array<float,4>& eye_box,
-                float& out_x, float& out_y) const {
+                float& out_x, float& out_y) {
         int ex1,ey1,ex2,ey2;
         if(!GetClippedEyeRegion(eye_box,ex1,ey1,ex2,ey2)) return false;
         const int roi_w=ex2-ex1, roi_h=ey2-ey1;
-        float nx,ny;
-        if(!FindPupilClassic(img_buf_+ey1*img_w_+ex1,img_w_,
-                             roi_w,roi_h,nx,ny)) return false;
-        out_x=ex1+nx*roi_w;
-        out_y=ey1+ny*roi_h;
-        return true;
+        if(model_ready_&&DetectWithModel(ex1,ey1,roi_w,roi_h,out_x,out_y))
+            return true;
+        return DetectClassic(ex1,ey1,roi_w,roi_h,out_x,out_y);
+    }
+    bool ModelEnabled() const { return model_ready_; }
+    const char* ModeName() const {
+        return model_ready_ ? "model+classic fallback" : "classic";
     }
     bool GetDarkRatio(const std::array<float,4>& eye_box,
                       float& dark_ratio) const {
@@ -125,11 +129,167 @@ public:
         return true;
     }
     void Release() {
+        if(output_ready_) release_tensor(outputs_[0]);
+        if(model_input_ready_) release_tensor(model_input_);
         release_tensor(linux_tensor_);
         delete[] img_buf_;
         img_buf_=nullptr;
     }
 private:
+    static const int MODEL_INPUT_SIZE=224;
+
+    bool DetectClassic(int ex1,int ey1,int roi_w,int roi_h,
+                       float& out_x,float& out_y) const {
+        float nx,ny;
+        if(!FindPupilClassic(img_buf_+ey1*img_w_+ex1,img_w_,
+                             roi_w,roi_h,nx,ny)) return false;
+        out_x=ex1+nx*roi_w;
+        out_y=ey1+ny*roi_h;
+        return true;
+    }
+
+    void TryInitializeModel(const std::string& model_path) {
+        if(model_path.empty()){
+            printf("[PupilDetector] pupil model path empty, use classic\n");
+            return;
+        }
+        std::ifstream fin(model_path.c_str(),std::ios::binary);
+        if(!fin.good()){
+            printf("[PupilDetector] optional model not found: %s, use classic\n",
+                   model_path.c_str());
+            return;
+        }
+        char* path_char=const_cast<char*>(model_path.c_str());
+        model_id_=ssne_loadmodel(path_char,SSNE_STATIC_ALLOC);
+
+        int input_num=ssne_get_model_input_num(model_id_);
+        if(input_num!=1){
+            printf("[PupilDetector] model load check failed, input_num=%d, use classic\n",
+                   input_num);
+            return;
+        }
+
+        int dtype=SSNE_UINT8;
+        if(ssne_get_model_input_dtype(model_id_,&dtype)!=SSNE_ERRCODE_NO_ERROR){
+            printf("[PupilDetector] failed to query model dtype, use classic\n");
+            return;
+        }
+        if(dtype!=SSNE_UINT8&&dtype!=SSNE_FLOAT32){
+            printf("[PupilDetector] unsupported model dtype=%d, use classic\n",dtype);
+            return;
+        }
+
+        model_input_dtype_=dtype;
+        if(model_input_dtype_==SSNE_FLOAT32){
+            model_input_=create_tensor(MODEL_INPUT_SIZE,MODEL_INPUT_SIZE,
+                                       SSNE_BYTES,SSNE_BUF_AI);
+            set_data_type(model_input_,SSNE_FLOAT32);
+            model_input_f32_.resize(MODEL_INPUT_SIZE*MODEL_INPUT_SIZE);
+        } else {
+            model_input_=create_tensor(MODEL_INPUT_SIZE,MODEL_INPUT_SIZE,
+                                       SSNE_Y_8,SSNE_BUF_AI);
+            model_input_u8_.resize(MODEL_INPUT_SIZE*MODEL_INPUT_SIZE);
+        }
+        model_input_ready_=true;
+        model_ready_=true;
+        printf("[PupilDetector] optional model ready: %s dtype=%d\n",
+               model_path.c_str(),model_input_dtype_);
+    }
+
+    bool DetectWithModel(int ex1,int ey1,int roi_w,int roi_h,
+                         float& out_x,float& out_y) {
+        if(!FillModelInput(ex1,ey1,roi_w,roi_h)){
+            DisableModelOnce("[PupilDetector] pupil model input failed, switch to classic\n");
+            return false;
+        }
+
+        if(ssne_inference(model_id_,1,&model_input_)!=SSNE_ERRCODE_NO_ERROR){
+            DisableModelOnce("[PupilDetector] pupil model inference failed, switch to classic\n");
+            return false;
+        }
+        if(ssne_getoutput(model_id_,1,outputs_)!=SSNE_ERRCODE_NO_ERROR){
+            DisableModelOnce("[PupilDetector] pupil model output failed, switch to classic\n");
+            return false;
+        }
+        output_ready_=true;
+
+        if(get_data_type(outputs_[0])!=SSNE_FLOAT32||
+           get_mem_size(outputs_[0])<2*sizeof(float)){
+            DisableModelOnce("[PupilDetector] pupil model output type invalid, switch to classic\n");
+            return false;
+        }
+        float* out=static_cast<float*>(get_data(outputs_[0]));
+        if(!out){
+            DisableModelOnce("[PupilDetector] pupil model output is null, switch to classic\n");
+            return false;
+        }
+        float nx=out[0], ny=out[1];
+        if(!std::isfinite(nx)||!std::isfinite(ny)||
+           nx<-0.25f||nx>1.25f||ny<-0.25f||ny>1.25f){
+            DisableModelOnce("[PupilDetector] pupil model output invalid, switch to classic\n");
+            return false;
+        }
+        nx=std::max(0.f,std::min(1.f,nx));
+        ny=std::max(0.f,std::min(1.f,ny));
+        out_x=ex1+nx*roi_w;
+        out_y=ey1+ny*roi_h;
+        return true;
+    }
+
+    bool FillModelInput(int ex1,int ey1,int roi_w,int roi_h) {
+        const int pixels=MODEL_INPUT_SIZE*MODEL_INPUT_SIZE;
+        if(model_input_dtype_==SSNE_FLOAT32){
+            if((int)model_input_f32_.size()!=pixels) return false;
+        } else {
+            if((int)model_input_u8_.size()!=pixels) return false;
+        }
+
+        for(int y=0;y<MODEL_INPUT_SIZE;y++){
+            float sy=ey1+(y+0.5f)*roi_h/MODEL_INPUT_SIZE-0.5f;
+            sy=std::max(static_cast<float>(ey1),
+                        std::min(static_cast<float>(ey1+roi_h-1),sy));
+            int y0=static_cast<int>(std::floor(sy));
+            int y1=std::min(ey1+roi_h-1,y0+1);
+            float fy=sy-y0;
+            for(int x=0;x<MODEL_INPUT_SIZE;x++){
+                float sx=ex1+(x+0.5f)*roi_w/MODEL_INPUT_SIZE-0.5f;
+                sx=std::max(static_cast<float>(ex1),
+                            std::min(static_cast<float>(ex1+roi_w-1),sx));
+                int x0=static_cast<int>(std::floor(sx));
+                int x1=std::min(ex1+roi_w-1,x0+1);
+                float fx=sx-x0;
+                float p00=img_buf_[y0*img_w_+x0];
+                float p01=img_buf_[y0*img_w_+x1];
+                float p10=img_buf_[y1*img_w_+x0];
+                float p11=img_buf_[y1*img_w_+x1];
+                float top=p00+(p01-p00)*fx;
+                float bottom=p10+(p11-p10)*fx;
+                float pix=top+(bottom-top)*fy;
+                int idx=y*MODEL_INPUT_SIZE+x;
+                if(model_input_dtype_==SSNE_FLOAT32){
+                    model_input_f32_[idx]=pix/255.f;
+                } else {
+                    int v=static_cast<int>(pix+0.5f);
+                    model_input_u8_[idx]=static_cast<uint8_t>(
+                        std::max(0,std::min(255,v)));
+                }
+            }
+        }
+
+        if(model_input_dtype_==SSNE_FLOAT32){
+            return load_tensor_buffer_ptr(
+                model_input_,model_input_f32_.data(),
+                pixels*static_cast<int>(sizeof(float)))==SSNE_ERRCODE_NO_ERROR;
+        }
+        return load_tensor_buffer_ptr(
+            model_input_,model_input_u8_.data(),pixels)==SSNE_ERRCODE_NO_ERROR;
+    }
+
+    void DisableModelOnce(const char* msg) {
+        if(model_ready_) printf("%s",msg);
+        model_ready_=false;
+    }
+
     bool GetClippedEyeRegion(const std::array<float,4>& eye_box,
                              int& x1,int& y1,int& x2,int& y2) const {
         x1=std::max(0,std::min(img_w_,static_cast<int>(std::floor(eye_box[0]))));
@@ -142,6 +302,15 @@ private:
     int img_w_=0, img_h_=0;
     ssne_tensor_t linux_tensor_;
     int buf_size_=0;
+    bool model_ready_=false;
+    bool model_input_ready_=false;
+    bool output_ready_=false;
+    int model_input_dtype_=SSNE_UINT8;
+    uint16_t model_id_=0;
+    ssne_tensor_t model_input_;
+    ssne_tensor_t outputs_[1];
+    std::vector<uint8_t> model_input_u8_;
+    std::vector<float> model_input_f32_;
 };
 
 std::array<float,4> GetEyeBox(const std::array<float,4>& face,
@@ -724,6 +893,13 @@ int main(){
     int img_width=640, img_height=480;
     array<int,2> det_shape={640,480};
     string path_det="/app_demo/app_assets/models/face_640x480.m1model";
+    string path_pupil="/app_demo/app_assets/models/pupil_gap.m1model";
+    const char* pupil_model_env=std::getenv("PUPIL_GAP_MODEL");
+    if(pupil_model_env&&pupil_model_env[0]) path_pupil=pupil_model_env;
+    bool enable_pupil_model=true;
+    const char* pupil_mode_env=std::getenv("PUPIL_DETECT_MODE");
+    if(pupil_mode_env&&std::string(pupil_mode_env)=="classic")
+        enable_pupil_model=false;
 
     if(ssne_initial()){fprintf(stderr,"SSNE init failed\n");return -1;}
 
@@ -745,8 +921,8 @@ int main(){
     printf("[INFO] Face model OK\n");
 
     PupilDetector pupil_det;
-    pupil_det.Initialize(img_width,img_height);
-    printf("[INFO] Pupil detector OK\n");
+    pupil_det.Initialize(img_width,img_height,path_pupil,enable_pupil_model);
+    printf("[INFO] Pupil detector OK (%s)\n",pupil_det.ModeName());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
