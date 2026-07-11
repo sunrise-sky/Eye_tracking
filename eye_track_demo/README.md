@@ -514,3 +514,34 @@ ReleaseAIPreprocessPipe(pipe_offline);                                 // 释放
 - 优雅退出和资源管理
 
 演示程序会持续处理双目图像帧，主线程保证ISP debug的实时性，推理线程在后台异步处理人脸检测，在检测到人脸时分别在上下两个显示区域显示检测结果。
+
+## eye_track_model 多速率算法
+
+`ssne_ai_demo_model` 是默认运行程序。它将每帧瞳孔和注视点更新与低频
+SCRFD 人脸框刷新解耦，并包含以下状态：
+
+- `TRACKING`：瞳孔稳定，SCRFD 默认 30 Hz；
+- `DEGRADED`：单眼或低置信度，SCRFD 默认 60 Hz；
+- `REACQUIRE`：人脸或双眼连续丢失，SCRFD 对最新帧连续重捕。
+
+传统瞳孔算法使用灰度直方图、自适应阈值、局部搜索和置信度评分。
+`pupil_gap.m1model` 默认仅在低置信度时用于恢复；注视坐标使用 One Euro
+Filter，默认参数为 `min_cutoff=3.0`、`beta=0.6`、`d_cutoff=1.0`。
+
+运行参数均可通过环境变量覆盖：
+
+```sh
+export PUPIL_DETECT_MODE=hybrid       # hybrid / classic / model
+export PUPIL_GAP_MODEL=/app_demo/app_assets/models/pupil_gap.m1model
+export SCRFD_TRACKING_HZ=30
+export SCRFD_DEGRADED_HZ=60
+export PUPIL_CONFIDENCE_MIN=0.45
+export ONE_EURO_MIN_CUTOFF=3.0
+export ONE_EURO_BETA=0.6
+export ONE_EURO_D_CUTOFF=1.0
+./scripts/run.sh
+```
+
+程序每秒输出一次 `[PERF]`，其中 `epp_fps` 为完成处理的帧率，`gaze` 为
+有效注视结果数，`scrfd` 为实际人脸模型调用数，`model_recovery` 为瞳孔模型
+恢复次数，并同时输出队列深度、平均/最大端到端延迟和当前跟踪状态。

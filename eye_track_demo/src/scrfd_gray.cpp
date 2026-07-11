@@ -10,6 +10,7 @@
 #include "../include/utils.hpp"
 #include <iostream>
 #include <cstdio>
+#include <numeric>
 
 namespace utils {
 
@@ -98,71 +99,71 @@ void SortDetectionResult(FaceDetectionResult* result) {
  * @description 去除重叠的检测框，保留分数最高的检测结果
  */
 void NMS(FaceDetectionResult* result, float iou_threshold, int top_k) {
-  // 根据检测分数对检测结果进行排序整理
-  SortDetectionResult(result);
+  const size_t count=result->boxes.size();
+  if(count==0) return;
 
-  // 保留其中的top-K个值
-  int res_count = static_cast<int>(result->boxes.size());
-  result->Resize(std::min(res_count, top_k));
-  
-  // 计算每个检测框的面积
-  std::vector<float> area_of_boxes(result->boxes.size());
-  std::vector<int> suppressed(result->boxes.size(), 0);  // 标记被抑制的框
-  for (size_t i = 0; i < result->boxes.size(); ++i) {
-    // 计算检测框面积：(x2-x1+1) * (y2-y1+1)
-    area_of_boxes[i] = (result->boxes[i][2] - result->boxes[i][0] + 1) *
-                       (result->boxes[i][3] - result->boxes[i][1] + 1);
-  }
-  
-  // NMS过程：遍历所有检测框，抑制与高分框重叠度高的低分框
-  for (size_t i = 0; i < result->boxes.size(); ++i) {
-    if (suppressed[i] == 1) {
-      continue;  // 跳过已被抑制的框
-    }
-    for (size_t j = i + 1; j < result->boxes.size(); ++j) {
-      if (suppressed[j] == 1) {
-        continue;  // 跳过已被抑制的框
-      }
-      // 计算两个框的交集区域
-      float xmin = std::max(result->boxes[i][0], result->boxes[j][0]);
-      float ymin = std::max(result->boxes[i][1], result->boxes[j][1]);
-      float xmax = std::min(result->boxes[i][2], result->boxes[j][2]);
-      float ymax = std::min(result->boxes[i][3], result->boxes[j][3]);
-      float overlap_w = std::max(0.0f, xmax - xmin + 1);
-      float overlap_h = std::max(0.0f, ymax - ymin + 1);
-      float overlap_area = overlap_w * overlap_h;
-      // 计算IoU（交并比）：交集面积 / 并集面积
-      float overlap_ratio =
-          overlap_area / (area_of_boxes[i] + area_of_boxes[j] - overlap_area);
-      // 如果IoU超过阈值，抑制低分框
-      if (overlap_ratio > iou_threshold) {
-        suppressed[j] = 1;
-      }
-    }
-  }
-  // 备份原始结果
-  FaceDetectionResult backup(*result);
-  int landmarks_per_face = result->landmarks_per_face;
+  const size_t limit=std::min(count,static_cast<size_t>(std::max(0,top_k)));
+  std::vector<size_t> order(count);
+  std::iota(order.begin(),order.end(),0);
+  const auto higher_score=[result](size_t lhs,size_t rhs){
+    return result->scores[lhs]>result->scores[rhs];
+  };
+  if(limit<count)
+    std::partial_sort(order.begin(),order.begin()+limit,order.end(),higher_score);
+  else
+    std::sort(order.begin(),order.end(),higher_score);
 
-  result->Clear();
-  // 在调用Reserve方法之前，不要忘记重置landmarks_per_face
-  result->landmarks_per_face = landmarks_per_face;
-  result->Reserve(suppressed.size());
-  // 只保留未被抑制的检测结果
-  for (size_t i = 0; i < suppressed.size(); ++i) {
-    if (suppressed[i] == 1) {
-      continue;  // 跳过被抑制的框
-    }
-    result->boxes.emplace_back(backup.boxes[i]);
-    result->scores.push_back(backup.scores[i]);
-    // 如果有关键点信息，也一并复制
-    if (result->landmarks_per_face > 0) {
-      for (size_t j = 0; j < result->landmarks_per_face; ++j) {
-        result->landmarks.emplace_back(
-            backup.landmarks[i * result->landmarks_per_face + j]);
-      }
+  std::vector<float> areas(limit);
+  std::vector<uint8_t> suppressed(limit,0);
+  for(size_t i=0;i<limit;i++){
+    const std::array<float,4>& box=result->boxes[order[i]];
+    areas[i]=(box[2]-box[0]+1.f)*(box[3]-box[1]+1.f);
+  }
+
+  for(size_t i=0;i<limit;i++){
+    if(suppressed[i]) continue;
+    const std::array<float,4>& lhs=result->boxes[order[i]];
+    for(size_t j=i+1;j<limit;j++){
+      if(suppressed[j]) continue;
+      const std::array<float,4>& rhs=result->boxes[order[j]];
+      const float xmin=std::max(lhs[0],rhs[0]);
+      const float ymin=std::max(lhs[1],rhs[1]);
+      const float xmax=std::min(lhs[2],rhs[2]);
+      const float ymax=std::min(lhs[3],rhs[3]);
+      const float overlap_w=std::max(0.f,xmax-xmin+1.f);
+      const float overlap_h=std::max(0.f,ymax-ymin+1.f);
+      const float overlap_area=overlap_w*overlap_h;
+      const float denominator=areas[i]+areas[j]-overlap_area;
+      const float overlap_ratio=denominator>0.f?overlap_area/denominator:0.f;
+      if(overlap_ratio>iou_threshold) suppressed[j]=1;
     }
   }
+
+  const int landmarks_per_face=result->landmarks_per_face;
+  std::vector<std::array<float,4>> kept_boxes;
+  std::vector<float> kept_scores;
+  std::vector<std::array<float,2>> kept_landmarks;
+  kept_boxes.reserve(limit);
+  kept_scores.reserve(limit);
+  if(landmarks_per_face>0)
+    kept_landmarks.reserve(limit*landmarks_per_face);
+
+  for(size_t i=0;i<limit;i++){
+    if(suppressed[i]) continue;
+    const size_t source=order[i];
+    kept_boxes.emplace_back(result->boxes[source]);
+    kept_scores.push_back(result->scores[source]);
+    if(landmarks_per_face>0){
+      for(int j=0;j<landmarks_per_face;j++)
+        kept_landmarks.emplace_back(
+            result->landmarks[source*landmarks_per_face+j]);
+    }
+  }
+
+  result->boxes.swap(kept_boxes);
+  result->scores.swap(kept_scores);
+  result->landmarks.swap(kept_landmarks);
+  result->landmarks_per_face=landmarks_per_face;
 }
 }  // namespace utils
 
@@ -426,11 +427,6 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
     // 获取模型输出：6个输出tensor（3个分数输出 + 3个检测框输出）
     ssne_getoutput(model_id, 6, outputs);
     
-    // 数据类型转换：从tensor中提取数据并转换为标准格式
-    std::vector<std::array<float, 4>> bboxes;
-    std::vector<float> scores;
-    std::array<float, 4> tmp_bbox;
-
     // 获取三个不同尺度层的输出数据
     float *out_scores0 = (float*)get_data(outputs[0]);  // 第一层分数输出
     float *out_scores1 = (float*)get_data(outputs[1]);  // 第二层分数输出
@@ -439,62 +435,48 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
     float *out_bboxes1 = (float*)get_data(outputs[4]);  // 第二层检测框输出
     float *out_bboxes2 = (float*)get_data(outputs[5]);  // 第三层检测框输出
     
-    // 处理第一层输出（最细粒度，检测框数量最多）
-    // printf("Det --- processing layer 1 output!\n");
-    int idx_s = 0;  // 分数索引
-    int idx_b = 0;  // 检测框索引
-    int num_bbox = det_shape[0] * det_shape[1] / 1024;  // 每层的检测框数量
-    for (int i = 0; i < num_bbox * 16; i++) {
-        for (int j = 0; j < 2; j++) {
-            scores.push_back(out_scores0[idx_s]);
-            idx_s += 1;
-            
-            // 提取检测框坐标 [x1, y1, x2, y2]
-            for (int k = 0; k < 4; k++) {
-                tmp_bbox[k] = out_bboxes0[idx_b+k];                
-            }
-            idx_b+=4;
-            bboxes.push_back(tmp_bbox);            
+    result->Clear();
+    result->Reserve(std::min(box_len,top_k*4));
+    result->landmarks_per_face=0;
+    size_t anchor_offset=0;
+    const auto collect_candidates=[&](float* score_data,float* bbox_data,
+                                      int candidate_count){
+        if(!score_data||!bbox_data){
+            anchor_offset+=candidate_count;
+            return;
         }
-    }
-
-    // 处理第二层输出（中等粒度）
-    // printf("Det --- processing layer 2 output!\n");
-    idx_s = 0;
-    idx_b = 0;
-    for (int i = 0; i < num_bbox * 4; i++) {
-        for (int j = 0; j < 2; j++) {
-            scores.push_back(out_scores1[idx_s]);
-            idx_s += 1;
-            
-            for (int k = 0; k < 4; k++) {
-                tmp_bbox[k] = out_bboxes1[idx_b+k];                
-            }
-            idx_b+=4;
-            bboxes.push_back(tmp_bbox);            
+        for(int i=0;i<candidate_count;i++){
+            const size_t anchor_index=anchor_offset+static_cast<size_t>(i);
+            if(anchor_index>=anchors.size()) break;
+            const float score=score_data[i];
+            if(score<=conf_threshold) continue;
+            const std::array<float,4>& anchor=anchors[anchor_index];
+            const float* raw_box=bbox_data+i*4;
+            const std::array<float,4> decoded={
+                fmax(0.f,anchor[0]-raw_box[0]),
+                fmax(0.f,anchor[1]-raw_box[1]),
+                fmin(static_cast<float>(det_shape[0]),anchor[0]+raw_box[2]),
+                fmin(static_cast<float>(det_shape[1]),anchor[1]+raw_box[3])
+            };
+            result->boxes.emplace_back(decoded);
+            result->scores.push_back(score);
         }
-    }
+        anchor_offset+=candidate_count;
+    };
 
-    // 处理第三层输出（最粗粒度，检测框数量最少）
-    // printf("Det --- processing layer 3 output!\n");
-    idx_s = 0;
-    idx_b = 0;    
-    for (int i = 0; i < num_bbox; i++) {
-        for (int j = 0; j < 2; j++) {
-            scores.push_back(out_scores2[idx_s]);
-            idx_s += 1;
-            
-            for (int k = 0; k < 4; k++) {
-                tmp_bbox[k] = out_bboxes2[idx_b+k];                
-            }
-            idx_b+=4;
-            bboxes.push_back(tmp_bbox);            
-        }
-    }
+    const int num_bbox=det_shape[0]*det_shape[1]/1024;
+    collect_candidates(out_scores0,out_bboxes0,num_bbox*32);
+    collect_candidates(out_scores1,out_bboxes1,num_bbox*8);
+    collect_candidates(out_scores2,out_bboxes2,num_bbox*2);
 
-    
-    // 执行后处理：解码、过滤、NMS、尺度恢复
-    Postprocess(&bboxes, &scores, result, &conf_threshold);
+    utils::NMS(result,nms_threshold,top_k);
+    result->Resize(std::min(static_cast<int>(result->boxes.size()),keep_top_k));
+    for(size_t i=0;i<result->boxes.size();i++){
+        result->boxes[i][0]*=w_scale;
+        result->boxes[i][1]*=h_scale;
+        result->boxes[i][2]*=w_scale;
+        result->boxes[i][3]*=h_scale;
+    }
 }
 
 /**
@@ -565,4 +547,3 @@ void SCRFDGRAY::saveFloatBin(const float* data, int length, const char* filename
         std::cerr << "failed to write " << filename << std::endl;
     }
 }
-

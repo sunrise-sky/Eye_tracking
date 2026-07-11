@@ -61,29 +61,30 @@ GazeDirection ClassifyGaze(float nx, float ny) {
     return GAZE_CENTER;
 }
 
-bool FindPupilClassic(const uint8_t* gray, int stride, int w, int h,
-                      float& nx, float& ny) {
-    if(!gray||stride<w||w<=0||h<=0) return false;
-    uint64_t sum=0;
-    for(int y=0;y<h;y++)
-        for(int x=0;x<w;x++)
-            sum+=gray[y*stride+x];
-    float mean=(float)sum/(w*h);
-    float thr=mean*0.55f;
-    float cx=0,cy=0; int cnt=0;
-    for(int y=0;y<h;y++)
-        for(int x=0;x<w;x++)
-            if(gray[y*stride+x]<thr){cx+=x;cy+=y;cnt++;}
-    if(cnt<4) return false;
-    nx=(cx/cnt)/(float)w; ny=(cy/cnt)/(float)h;
-    return true;
+struct PupilObservation {
+    bool valid;
+    float x;
+    float y;
+    float confidence;
+    float blink_dark_ratio;
+    bool blink_valid;
+    bool used_model;
+
+    PupilObservation()
+        :valid(false),x(0.f),y(0.f),confidence(0.f),
+         blink_dark_ratio(0.f),blink_valid(false),used_model(false){}
+};
+
+float Clamp01(float value) {
+    return std::max(0.f,std::min(1.f,value));
 }
 
 class PupilDetector {
 public:
     void Initialize(int w, int h, const std::string& model_path,
-                    bool enable_model=true) {
+                    bool enable_model=true, bool prefer_model=false) {
         img_w_=w; img_h_=h;
+        prefer_model_=prefer_model;
         linux_tensor_=create_tensor(w,h,SSNE_Y_8,SSNE_BUF_LINUX);
         buf_size_=w*h;
         img_buf_=new uint8_t[buf_size_];
@@ -96,37 +97,45 @@ public:
         if(save_tensor_buffer_ptr(linux_tensor_,img_buf_,buf_size_)!=SSNE_ERRCODE_NO_ERROR) return false;
         return true;
     }
-    bool Detect(const std::array<float,4>& eye_box,
-                float& out_x, float& out_y) {
+    PupilObservation Detect(const std::array<float,4>& eye_box,
+                            const PupilObservation* previous,
+                            bool allow_model_fallback) {
         int ex1,ey1,ex2,ey2;
-        if(!GetClippedEyeRegion(eye_box,ex1,ey1,ex2,ey2)) return false;
+        if(!GetClippedEyeRegion(eye_box,ex1,ey1,ex2,ey2))
+            return PupilObservation();
         const int roi_w=ex2-ex1, roi_h=ey2-ey1;
-        if(model_ready_&&DetectWithModel(ex1,ey1,roi_w,roi_h,out_x,out_y))
-            return true;
-        return DetectClassic(ex1,ey1,roi_w,roi_h,out_x,out_y);
+
+        if(prefer_model_&&allow_model_fallback&&model_ready_){
+            PupilObservation model=DetectWithModel(
+                ex1,ey1,roi_w,roi_h,previous);
+            if(model.valid){
+                model.blink_dark_ratio=ComputeBlinkDarkRatio(
+                    ex1,ey1,roi_w,roi_h);
+                model.blink_valid=true;
+                return model;
+            }
+        }
+
+        PupilObservation classic=DetectClassic(
+            ex1,ey1,roi_w,roi_h,previous);
+        if(allow_model_fallback&&model_ready_&&
+           (!classic.valid||classic.confidence<MODEL_FALLBACK_CONFIDENCE)){
+            PupilObservation model=DetectWithModel(
+                ex1,ey1,roi_w,roi_h,previous);
+            if(model.valid){
+                model.blink_dark_ratio=classic.blink_dark_ratio;
+                model.blink_valid=classic.blink_valid;
+                return model;
+            }
+        }
+        return classic;
     }
     bool ModelEnabled() const { return model_ready_; }
+    bool PreferModel() const { return prefer_model_; }
     const char* ModeName() const {
-        return model_ready_ ? "model+classic fallback" : "classic";
-    }
-    bool GetDarkRatio(const std::array<float,4>& eye_box,
-                      float& dark_ratio) const {
-        int ex1,ey1,ex2,ey2;
-        if(!GetClippedEyeRegion(eye_box,ex1,ey1,ex2,ey2)) return false;
-        const int roi_w=ex2-ex1, roi_h=ey2-ey1;
-        uint64_t sum=0;
-        for(int y=ey1;y<ey2;y++)
-            for(int x=ex1;x<ex2;x++)
-                sum+=img_buf_[y*img_w_+x];
-        const int pixels=roi_w*roi_h;
-        const float mean=static_cast<float>(sum)/pixels;
-        const float threshold=mean*0.6f;
-        int dark=0;
-        for(int y=ey1;y<ey2;y++)
-            for(int x=ex1;x<ex2;x++)
-                if(img_buf_[y*img_w_+x]<threshold) dark++;
-        dark_ratio=static_cast<float>(dark)/pixels;
-        return true;
+        if(!model_ready_) return "classic";
+        return prefer_model_ ? "model primary + classic fallback" :
+                               "classic + model recovery";
     }
     void Release() {
         if(output_ready_) release_tensor(outputs_[0]);
@@ -137,15 +146,119 @@ public:
     }
 private:
     static const int MODEL_INPUT_SIZE=224;
+    static constexpr float MODEL_FALLBACK_CONFIDENCE=0.45f;
+    static const int HISTOGRAM_BINS=64;
 
-    bool DetectClassic(int ex1,int ey1,int roi_w,int roi_h,
-                       float& out_x,float& out_y) const {
-        float nx,ny;
-        if(!FindPupilClassic(img_buf_+ey1*img_w_+ex1,img_w_,
-                             roi_w,roi_h,nx,ny)) return false;
-        out_x=ex1+nx*roi_w;
-        out_y=ey1+ny*roi_h;
-        return true;
+    PupilObservation DetectClassic(int ex1,int ey1,int roi_w,int roi_h,
+                                   const PupilObservation* previous) const {
+        PupilObservation result;
+        int histogram[HISTOGRAM_BINS]={0};
+        uint64_t intensity_sum=0;
+        const int roi_pixels=roi_w*roi_h;
+
+        for(int y=ey1;y<ey1+roi_h;y++){
+            const uint8_t* row=img_buf_+y*img_w_;
+            for(int x=ex1;x<ex1+roi_w;x++){
+                const uint8_t pixel=row[x];
+                histogram[pixel>>2]++;
+                intensity_sum+=pixel;
+            }
+        }
+        if(roi_pixels<=0) return result;
+
+        const float mean=static_cast<float>(intensity_sum)/roi_pixels;
+        const int blink_bin=std::max(0,std::min(
+            HISTOGRAM_BINS-1,static_cast<int>(mean*0.6f)>>2));
+        int blink_dark=0;
+        for(int i=0;i<=blink_bin;i++) blink_dark+=histogram[i];
+        result.blink_dark_ratio=static_cast<float>(blink_dark)/roi_pixels;
+        result.blink_valid=true;
+
+        const int percentile_target=std::max(4,roi_pixels*18/100);
+        int cumulative=0;
+        int percentile_bin=0;
+        for(;percentile_bin<HISTOGRAM_BINS;percentile_bin++){
+            cumulative+=histogram[percentile_bin];
+            if(cumulative>=percentile_target) break;
+        }
+        const int percentile_threshold=std::min(
+            255,percentile_bin*4+3);
+        const int pupil_threshold=std::max(2,std::min(
+            percentile_threshold,static_cast<int>(mean*0.78f)));
+
+        int sx1=ex1,sy1=ey1,sx2=ex1+roi_w,sy2=ey1+roi_h;
+        if(previous&&previous->valid&&previous->confidence>=0.40f&&
+           previous->x>=ex1&&previous->x<ex1+roi_w&&
+           previous->y>=ey1&&previous->y<ey1+roi_h){
+            const int half_w=std::max(6,static_cast<int>(roi_w*0.38f));
+            const int half_h=std::max(4,static_cast<int>(roi_h*0.42f));
+            const int px=static_cast<int>(previous->x+0.5f);
+            const int py=static_cast<int>(previous->y+0.5f);
+            sx1=std::max(ex1,px-half_w);
+            sy1=std::max(ey1,py-half_h);
+            sx2=std::min(ex1+roi_w,px+half_w+1);
+            sy2=std::min(ey1+roi_h,py+half_h+1);
+        }
+
+        double weight_sum=0.0;
+        double weighted_x=0.0,weighted_y=0.0;
+        double weighted_x2=0.0,weighted_y2=0.0;
+        uint64_t dark_intensity_sum=0;
+        int dark_count=0;
+        for(int y=sy1;y<sy2;y++){
+            const uint8_t* row=img_buf_+y*img_w_;
+            for(int x=sx1;x<sx2;x++){
+                const int pixel=row[x];
+                if(pixel>pupil_threshold) continue;
+                const double weight=pupil_threshold-pixel+1;
+                weight_sum+=weight;
+                weighted_x+=weight*x;
+                weighted_y+=weight*y;
+                weighted_x2+=weight*x*x;
+                weighted_y2+=weight*y*y;
+                dark_intensity_sum+=pixel;
+                dark_count++;
+            }
+        }
+        const int search_pixels=std::max(1,(sx2-sx1)*(sy2-sy1));
+        if(dark_count<4||weight_sum<=0.0) return result;
+
+        const float cx=static_cast<float>(weighted_x/weight_sum);
+        const float cy=static_cast<float>(weighted_y/weight_sum);
+        const float variance_x=std::max(0.f,static_cast<float>(
+            weighted_x2/weight_sum-cx*cx));
+        const float variance_y=std::max(0.f,static_cast<float>(
+            weighted_y2/weight_sum-cy*cy));
+        const float spread=std::sqrt(variance_x)/std::max(1,roi_w)+
+                           std::sqrt(variance_y)/std::max(1,roi_h);
+        const float compactness=Clamp01((0.34f-spread)/0.25f);
+        const float dark_mean=static_cast<float>(dark_intensity_sum)/dark_count;
+        const float contrast=Clamp01((mean-dark_mean)/std::max(1.f,mean)*2.5f);
+        const float dark_ratio=static_cast<float>(dark_count)/search_pixels;
+        const float ratio_score=dark_ratio<=0.12f ?
+            Clamp01(dark_ratio/0.12f) : Clamp01((0.48f-dark_ratio)/0.36f);
+
+        float temporal_score=0.65f;
+        if(previous&&previous->valid){
+            const float dx=cx-previous->x,dy=cy-previous->y;
+            const float distance=std::sqrt(dx*dx+dy*dy);
+            const float radius=std::max(4.f,roi_w*0.28f);
+            const float normalized=distance/radius;
+            temporal_score=1.f/(1.f+normalized*normalized);
+        }
+        const float edge_x=std::min(cx-ex1,ex1+roi_w-1-cx);
+        const float edge_y=std::min(cy-ey1,ey1+roi_h-1-cy);
+        const float edge_score=Clamp01(std::min(
+            edge_x/std::max(1.f,roi_w*0.08f),
+            edge_y/std::max(1.f,roi_h*0.08f)));
+
+        result.x=cx;
+        result.y=cy;
+        result.confidence=Clamp01(0.35f*contrast+0.20f*ratio_score+
+                                  0.20f*compactness+0.15f*temporal_score+
+                                  0.10f*edge_score);
+        result.valid=dark_ratio<0.48f&&result.confidence>=0.28f;
+        return result;
     }
 
     void TryInitializeModel(const std::string& model_path) {
@@ -196,44 +309,73 @@ private:
                model_path.c_str(),model_input_dtype_);
     }
 
-    bool DetectWithModel(int ex1,int ey1,int roi_w,int roi_h,
-                         float& out_x,float& out_y) {
+    PupilObservation DetectWithModel(int ex1,int ey1,int roi_w,int roi_h,
+                                     const PupilObservation* previous) {
+        PupilObservation result;
         if(!FillModelInput(ex1,ey1,roi_w,roi_h)){
             DisableModelOnce("[PupilDetector] pupil model input failed, switch to classic\n");
-            return false;
+            return result;
         }
 
         if(ssne_inference(model_id_,1,&model_input_)!=SSNE_ERRCODE_NO_ERROR){
             DisableModelOnce("[PupilDetector] pupil model inference failed, switch to classic\n");
-            return false;
+            return result;
         }
         if(ssne_getoutput(model_id_,1,outputs_)!=SSNE_ERRCODE_NO_ERROR){
             DisableModelOnce("[PupilDetector] pupil model output failed, switch to classic\n");
-            return false;
+            return result;
         }
         output_ready_=true;
 
         if(get_data_type(outputs_[0])!=SSNE_FLOAT32||
            get_mem_size(outputs_[0])<2*sizeof(float)){
             DisableModelOnce("[PupilDetector] pupil model output type invalid, switch to classic\n");
-            return false;
+            return result;
         }
         float* out=static_cast<float*>(get_data(outputs_[0]));
         if(!out){
             DisableModelOnce("[PupilDetector] pupil model output is null, switch to classic\n");
-            return false;
+            return result;
         }
         float nx=out[0], ny=out[1];
         if(!std::isfinite(nx)||!std::isfinite(ny)||
            nx<-0.25f||nx>1.25f||ny<-0.25f||ny>1.25f){
             DisableModelOnce("[PupilDetector] pupil model output invalid, switch to classic\n");
-            return false;
+            return result;
         }
         nx=std::max(0.f,std::min(1.f,nx));
         ny=std::max(0.f,std::min(1.f,ny));
-        out_x=ex1+nx*roi_w;
-        out_y=ey1+ny*roi_h;
-        return true;
+        result.x=ex1+nx*roi_w;
+        result.y=ey1+ny*roi_h;
+        result.confidence=0.78f;
+        if(previous&&previous->valid){
+            const float dx=result.x-previous->x;
+            const float dy=result.y-previous->y;
+            const float normalized=std::sqrt(dx*dx+dy*dy)/
+                                   std::max(4.f,roi_w*0.35f);
+            result.confidence*=1.f/(1.f+normalized*normalized);
+        }
+        result.valid=result.confidence>=0.35f;
+        result.used_model=true;
+        return result;
+    }
+
+    float ComputeBlinkDarkRatio(int ex1,int ey1,int roi_w,int roi_h) const {
+        if(roi_w<=0||roi_h<=0) return 0.f;
+        uint64_t sum=0;
+        for(int y=ey1;y<ey1+roi_h;y++){
+            const uint8_t* row=img_buf_+y*img_w_;
+            for(int x=ex1;x<ex1+roi_w;x++) sum+=row[x];
+        }
+        const int pixels=roi_w*roi_h;
+        const float threshold=static_cast<float>(sum)/pixels*0.6f;
+        int dark=0;
+        for(int y=ey1;y<ey1+roi_h;y++){
+            const uint8_t* row=img_buf_+y*img_w_;
+            for(int x=ex1;x<ex1+roi_w;x++)
+                if(row[x]<threshold) dark++;
+        }
+        return static_cast<float>(dark)/pixels;
     }
 
     bool FillModelInput(int ex1,int ey1,int roi_w,int roi_h) {
@@ -302,6 +444,7 @@ private:
     int img_w_=0, img_h_=0;
     ssne_tensor_t linux_tensor_;
     int buf_size_=0;
+    bool prefer_model_=false;
     bool model_ready_=false;
     bool model_input_ready_=false;
     bool output_ready_=false;
@@ -312,6 +455,8 @@ private:
     std::vector<uint8_t> model_input_u8_;
     std::vector<float> model_input_f32_;
 };
+
+constexpr float PupilDetector::MODEL_FALLBACK_CONFIDENCE;
 
 std::array<float,4> GetEyeBox(const std::array<float,4>& face,
                                float cx, float cy, float iw, float ih) {
@@ -420,6 +565,282 @@ private:
     }
 };
 
+using PerfClock=std::chrono::steady_clock;
+
+float ReadEnvFloat(const char* name,float default_value,
+                   float min_value,float max_value) {
+    const char* raw=std::getenv(name);
+    if(!raw||!raw[0]) return default_value;
+    char* end=nullptr;
+    const float parsed=std::strtof(raw,&end);
+    if(end==raw||!std::isfinite(parsed)) return default_value;
+    return std::max(min_value,std::min(max_value,parsed));
+}
+
+struct AlgorithmConfig {
+    float scrfd_tracking_hz;
+    float scrfd_degraded_hz;
+    float pupil_confidence_min;
+    float one_euro_min_cutoff;
+    float one_euro_beta;
+    float one_euro_derivative_cutoff;
+
+    static AlgorithmConfig Load() {
+        AlgorithmConfig config;
+        config.scrfd_tracking_hz=ReadEnvFloat(
+            "SCRFD_TRACKING_HZ",30.f,5.f,120.f);
+        config.scrfd_degraded_hz=ReadEnvFloat(
+            "SCRFD_DEGRADED_HZ",60.f,10.f,180.f);
+        config.pupil_confidence_min=ReadEnvFloat(
+            "PUPIL_CONFIDENCE_MIN",0.45f,0.1f,0.9f);
+        config.one_euro_min_cutoff=ReadEnvFloat(
+            "ONE_EURO_MIN_CUTOFF",3.f,0.1f,20.f);
+        config.one_euro_beta=ReadEnvFloat(
+            "ONE_EURO_BETA",0.6f,0.f,5.f);
+        config.one_euro_derivative_cutoff=ReadEnvFloat(
+            "ONE_EURO_D_CUTOFF",1.f,0.1f,20.f);
+        return config;
+    }
+
+    void Print() const {
+        printf("[ALGO] scrfd_tracking_hz=%.1f scrfd_degraded_hz=%.1f "
+               "pupil_conf_min=%.2f one_euro=(%.2f,%.2f,%.2f)\n",
+               scrfd_tracking_hz,scrfd_degraded_hz,
+               pupil_confidence_min,one_euro_min_cutoff,
+               one_euro_beta,one_euro_derivative_cutoff);
+    }
+};
+
+class LowPassFilter {
+public:
+    LowPassFilter():initialized_(false),value_(0.f){}
+
+    float Filter(float value,float alpha) {
+        alpha=Clamp01(alpha);
+        if(!initialized_){
+            value_=value;
+            initialized_=true;
+        } else {
+            value_=alpha*value+(1.f-alpha)*value_;
+        }
+        return value_;
+    }
+
+    void Reset() { initialized_=false; value_=0.f; }
+
+private:
+    bool initialized_;
+    float value_;
+};
+
+class OneEuroFilter {
+public:
+    OneEuroFilter(float min_cutoff,float beta,float derivative_cutoff)
+        :min_cutoff_(min_cutoff),beta_(beta),
+         derivative_cutoff_(derivative_cutoff),initialized_(false),
+         last_raw_(0.f){}
+
+    float Filter(float value,PerfClock::time_point now) {
+        if(!initialized_){
+            initialized_=true;
+            last_time_=now;
+            last_raw_=value;
+            derivative_filter_.Reset();
+            value_filter_.Reset();
+            derivative_filter_.Filter(0.f,1.f);
+            return value_filter_.Filter(value,1.f);
+        }
+
+        float dt=std::chrono::duration<float>(now-last_time_).count();
+        dt=std::max(1.f/500.f,std::min(0.1f,dt));
+        const float derivative=(value-last_raw_)/dt;
+        const float filtered_derivative=derivative_filter_.Filter(
+            derivative,Alpha(dt,derivative_cutoff_));
+        const float cutoff=min_cutoff_+beta_*std::fabs(filtered_derivative);
+        const float filtered=value_filter_.Filter(value,Alpha(dt,cutoff));
+        last_time_=now;
+        last_raw_=value;
+        return filtered;
+    }
+
+    void Reset() {
+        initialized_=false;
+        derivative_filter_.Reset();
+        value_filter_.Reset();
+    }
+
+private:
+    static float Alpha(float dt,float cutoff) {
+        const float tau=1.f/(2.f*3.14159265358979323846f*
+                             std::max(0.01f,cutoff));
+        return 1.f/(1.f+tau/dt);
+    }
+
+    float min_cutoff_;
+    float beta_;
+    float derivative_cutoff_;
+    bool initialized_;
+    float last_raw_;
+    PerfClock::time_point last_time_;
+    LowPassFilter derivative_filter_;
+    LowPassFilter value_filter_;
+};
+
+enum TrackingMode {
+    TRACKING_REACQUIRE=0,
+    TRACKING_DEGRADED=1,
+    TRACKING_STABLE=2
+};
+
+const char* TrackingModeName(TrackingMode mode) {
+    switch(mode){
+        case TRACKING_STABLE: return "TRACKING";
+        case TRACKING_DEGRADED: return "DEGRADED";
+        default: return "REACQUIRE";
+    }
+}
+
+class AdaptiveFaceTracker {
+public:
+    AdaptiveFaceTracker(int img_w,int img_h,const AlgorithmConfig& config)
+        :img_w_(img_w),img_h_(img_h),config_(config),valid_(false),
+         mode_(TRACKING_REACQUIRE),missed_detections_(0),
+         low_confidence_streak_(0),stable_pupil_streak_(0),
+         detector_attempted_(false),detector_succeeded_(false),
+         state_time_initialized_(false) {
+        box_.fill(0.f);
+        velocity_.fill(0.f);
+    }
+
+    bool ShouldRunDetector(PerfClock::time_point now) const {
+        if(!valid_||mode_==TRACKING_REACQUIRE||!detector_attempted_)
+            return true;
+        const float hz=mode_==TRACKING_STABLE ?
+            config_.scrfd_tracking_hz : config_.scrfd_degraded_hz;
+        const float elapsed=std::chrono::duration<float>(
+            now-last_detector_attempt_).count();
+        return elapsed>=1.f/std::max(1.f,hz);
+    }
+
+    void Predict(PerfClock::time_point now) {
+        if(!valid_){
+            state_time_=now;
+            state_time_initialized_=true;
+            return;
+        }
+        if(!state_time_initialized_){
+            state_time_=now;
+            state_time_initialized_=true;
+            return;
+        }
+        float dt=std::chrono::duration<float>(now-state_time_).count();
+        dt=std::max(0.f,std::min(0.1f,dt));
+        for(size_t i=0;i<box_.size();i++) box_[i]+=velocity_[i]*dt;
+        ClampBox(box_);
+        state_time_=now;
+    }
+
+    void UpdateDetection(const std::array<float,4>& measured,
+                         PerfClock::time_point now) {
+        last_detector_attempt_=now;
+        detector_attempted_=true;
+        std::array<float,4> clipped=measured;
+        ClampBox(clipped);
+        if(!valid_){
+            box_=clipped;
+            velocity_.fill(0.f);
+        } else {
+            float dt=detector_succeeded_ ?
+                std::chrono::duration<float>(now-last_detector_success_).count() :
+                1.f/config_.scrfd_tracking_hz;
+            dt=std::max(1.f/180.f,std::min(0.25f,dt));
+            for(size_t i=0;i<box_.size();i++){
+                const float residual=clipped[i]-box_[i];
+                box_[i]+=0.70f*residual;
+                velocity_[i]+=0.05f*residual/dt;
+            }
+            ClampBox(box_);
+        }
+        valid_=true;
+        detector_succeeded_=true;
+        last_detector_success_=now;
+        missed_detections_=0;
+        if(mode_==TRACKING_REACQUIRE) mode_=TRACKING_DEGRADED;
+        state_time_=now;
+        state_time_initialized_=true;
+    }
+
+    void UpdateDetectionMiss(PerfClock::time_point now) {
+        last_detector_attempt_=now;
+        detector_attempted_=true;
+        missed_detections_++;
+        const float age=detector_succeeded_ ?
+            std::chrono::duration<float>(now-last_detector_success_).count() :
+            1.f;
+        if(!valid_||missed_detections_>=3||age>0.15f){
+            valid_=false;
+            mode_=TRACKING_REACQUIRE;
+            velocity_.fill(0.f);
+        } else {
+            mode_=TRACKING_DEGRADED;
+        }
+    }
+
+    void UpdatePupilQuality(const PupilObservation& left,
+                            const PupilObservation& right) {
+        const bool any_valid=left.valid||right.valid;
+        const bool both_valid=left.valid&&right.valid;
+        const float confidence=both_valid ?
+            0.5f*(left.confidence+right.confidence) :
+            (left.valid?left.confidence:right.confidence)*0.75f;
+        if(!any_valid||confidence<config_.pupil_confidence_min){
+            low_confidence_streak_++;
+            stable_pupil_streak_=0;
+            mode_=low_confidence_streak_>=3 ?
+                TRACKING_REACQUIRE : TRACKING_DEGRADED;
+            if(low_confidence_streak_>=3) valid_=false;
+            return;
+        }
+        low_confidence_streak_=0;
+        stable_pupil_streak_++;
+        if(stable_pupil_streak_>=6&&missed_detections_==0)
+            mode_=TRACKING_STABLE;
+        else if(mode_==TRACKING_REACQUIRE)
+            mode_=TRACKING_DEGRADED;
+    }
+
+    bool Valid() const { return valid_; }
+    TrackingMode Mode() const { return mode_; }
+    const std::array<float,4>& Box() const { return box_; }
+
+private:
+    void ClampBox(std::array<float,4>& box) const {
+        box[0]=std::max(0.f,std::min(static_cast<float>(img_w_-2),box[0]));
+        box[1]=std::max(0.f,std::min(static_cast<float>(img_h_-2),box[1]));
+        box[2]=std::max(box[0]+2.f,
+                        std::min(static_cast<float>(img_w_),box[2]));
+        box[3]=std::max(box[1]+2.f,
+                        std::min(static_cast<float>(img_h_),box[3]));
+    }
+
+    int img_w_;
+    int img_h_;
+    AlgorithmConfig config_;
+    bool valid_;
+    TrackingMode mode_;
+    std::array<float,4> box_;
+    std::array<float,4> velocity_;
+    int missed_detections_;
+    int low_confidence_streak_;
+    int stable_pupil_streak_;
+    bool detector_attempted_;
+    bool detector_succeeded_;
+    bool state_time_initialized_;
+    PerfClock::time_point state_time_;
+    PerfClock::time_point last_detector_attempt_;
+    PerfClock::time_point last_detector_success_;
+};
+
 // 全局变量
 VISUALIZER* g_visualizer=nullptr;
 GazeCalibrator g_calibrator;
@@ -427,9 +848,8 @@ std::mutex g_calib_mtx;
 std::mutex mtx_image;
 std::condition_variable cv_image_ready;
 std::atomic<bool> stop_inference(false);
-const int MAX_QUEUE_SIZE=2;
+const int MAX_QUEUE_SIZE=1;
 const int FRAME_POOL_SIZE=MAX_QUEUE_SIZE+1;
-using PerfClock=std::chrono::steady_clock;
 struct InferenceFrame {
     int pool_index;
     uint64_t frame_id;
@@ -443,6 +863,10 @@ std::atomic<uint64_t> g_perf_dropped(0);
 std::atomic<uint64_t> g_perf_inferred(0);
 std::atomic<uint64_t> g_perf_latency_us(0);
 std::atomic<uint64_t> g_perf_latency_max_us(0);
+std::atomic<uint64_t> g_perf_detector_runs(0);
+std::atomic<uint64_t> g_perf_gaze_valid(0);
+std::atomic<uint64_t> g_perf_model_recovery(0);
+std::atomic<int> g_tracking_mode(TRACKING_REACQUIRE);
 bool g_exit_flag=false;
 std::mutex g_mtx;
 std::atomic<bool> g_clear_marks(false);
@@ -505,11 +929,15 @@ bool TryEnqueueInferenceFrame(ssne_tensor_t& source,
                               std::atomic<unsigned int>& free_mask,
                               uint64_t frame_id,
                               PerfClock::time_point captured_at){
-    if(g_queue_depth.load(std::memory_order_acquire)>=MAX_QUEUE_SIZE)
-        return false;
-
-    const int slot=TryAcquireFrameSlot(free_mask);
-    if(slot<0) return false;
+    int slot=TryAcquireFrameSlot(free_mask);
+    if(slot<0){
+        std::unique_lock<std::mutex> recycle_lock(mtx_image,std::try_to_lock);
+        if(!recycle_lock.owns_lock()||image_queue.empty()) return false;
+        slot=image_queue.front().pool_index;
+        image_queue.pop();
+        g_queue_depth.store(0,std::memory_order_release);
+        g_perf_dropped.fetch_add(1,std::memory_order_relaxed);
+    }
 
     if(copy_tensor_buffer(source,frame_pool[slot])!=SSNE_ERRCODE_NO_ERROR){
         ReturnFrameSlot(free_mask,slot);
@@ -517,9 +945,16 @@ bool TryEnqueueInferenceFrame(ssne_tensor_t& source,
     }
 
     std::unique_lock<std::mutex> lock(mtx_image,std::try_to_lock);
-    if(!lock.owns_lock()||image_queue.size()>=MAX_QUEUE_SIZE){
+    if(!lock.owns_lock()){
         ReturnFrameSlot(free_mask,slot);
         return false;
+    }
+
+    if(!image_queue.empty()){
+        const InferenceFrame stale=image_queue.front();
+        image_queue.pop();
+        ReturnFrameSlot(free_mask,stale.pool_index);
+        g_perf_dropped.fetch_add(1,std::memory_order_relaxed);
     }
 
     InferenceFrame frame;
@@ -542,6 +977,9 @@ void MaybeLogPerformance(){
     static uint64_t last_dropped=0;
     static uint64_t last_inferred=0;
     static uint64_t last_latency_us=0;
+    static uint64_t last_detector_runs=0;
+    static uint64_t last_gaze_valid=0;
+    static uint64_t last_model_recovery=0;
     const double elapsed=std::chrono::duration<double>(now-last_log).count();
     if(elapsed<1.0) return;
 
@@ -550,6 +988,12 @@ void MaybeLogPerformance(){
     const uint64_t dropped=g_perf_dropped.load(std::memory_order_relaxed);
     const uint64_t inferred=g_perf_inferred.load(std::memory_order_acquire);
     const uint64_t latency_us=g_perf_latency_us.load(std::memory_order_relaxed);
+    const uint64_t detector_runs=
+        g_perf_detector_runs.load(std::memory_order_relaxed);
+    const uint64_t gaze_valid=
+        g_perf_gaze_valid.load(std::memory_order_relaxed);
+    const uint64_t model_recovery=
+        g_perf_model_recovery.load(std::memory_order_relaxed);
     const uint64_t inferred_delta=inferred-last_inferred;
     const uint64_t latency_delta=latency_us-last_latency_us;
     const uint64_t latency_max_us=
@@ -558,19 +1002,28 @@ void MaybeLogPerformance(){
         static_cast<double>(latency_delta)/inferred_delta/1000.0;
 
     printf("[PERF] capture=%llu enqueue=%llu drop=%llu "
-           "infer_fps=%.1f queue=%d latency_ms_avg=%.1f latency_ms_max=%.1f\n",
+           "epp_fps=%.1f gaze=%llu scrfd=%llu model_recovery=%llu "
+           "queue=%d latency_ms_avg=%.1f latency_ms_max=%.1f mode=%s\n",
            static_cast<unsigned long long>(captured-last_captured),
            static_cast<unsigned long long>(enqueued-last_enqueued),
            static_cast<unsigned long long>(dropped-last_dropped),
            inferred_delta/elapsed,
+           static_cast<unsigned long long>(gaze_valid-last_gaze_valid),
+           static_cast<unsigned long long>(detector_runs-last_detector_runs),
+           static_cast<unsigned long long>(model_recovery-last_model_recovery),
            g_queue_depth.load(std::memory_order_acquire),
-           latency_avg_ms,latency_max_us/1000.0);
+           latency_avg_ms,latency_max_us/1000.0,
+           TrackingModeName(static_cast<TrackingMode>(
+               g_tracking_mode.load(std::memory_order_acquire))));
 
     last_captured=captured;
     last_enqueued=enqueued;
     last_dropped=dropped;
     last_inferred=inferred;
     last_latency_us=latency_us;
+    last_detector_runs=detector_runs;
+    last_gaze_valid=gaze_valid;
+    last_model_recovery=model_recovery;
     last_log=now;
 }
 
@@ -586,6 +1039,8 @@ void UpdateBlinkDetection(bool valid,float dark_ratio){
     static int rejected_long=0;
     static bool blink_active=false;
     static bool suppress_until_open=false;
+    static bool baseline_ready=false;
+    static float open_baseline=0.f;
     static PerfClock::time_point blink_start;
     static PerfClock::time_point open_start;
 
@@ -596,9 +1051,21 @@ void UpdateBlinkDetection(bool valid,float dark_ratio){
         return;
     }
 
-    const bool is_closed=dark_ratio<0.06f;
-    const bool is_open=dark_ratio>0.075f;
+    if(!baseline_ready){
+        open_baseline=std::max(0.02f,dark_ratio);
+        baseline_ready=true;
+    }
+    const float close_threshold=std::max(0.015f,open_baseline*0.60f);
+    const float open_threshold=std::max(close_threshold+0.008f,
+                                        open_baseline*0.78f);
+    const bool is_closed=dark_ratio<close_threshold;
+    const bool is_open=dark_ratio>open_threshold;
     const PerfClock::time_point now=PerfClock::now();
+
+    if(!blink_active&&!suppress_until_open&&!is_closed){
+        open_baseline=0.99f*open_baseline+0.01f*dark_ratio;
+        open_baseline=std::max(0.02f,std::min(0.40f,open_baseline));
+    }
 
     if(suppress_until_open){
         if(is_open){
@@ -712,11 +1179,20 @@ bool check_exit_flag(){
 void inference_thread_func(SCRFDGRAY* detector, PupilDetector* pupil_det,
                            ssne_tensor_t* frame_pool,
                            std::atomic<unsigned int>* free_frame_mask,
+                           AlgorithmConfig config,
                            int img_w, int img_h){
     printf("[Thread] Inference started\n");
-    FaceDetectionResult* det_result=new FaceDetectionResult;
-    const int SW=5;
-    std::vector<float> gnx_hist,gny_hist;
+    FaceDetectionResult det_result;
+    AdaptiveFaceTracker face_tracker(img_w,img_h,config);
+    PupilObservation left_history,right_history;
+    OneEuroFilter gaze_filter_x(config.one_euro_min_cutoff,
+                                config.one_euro_beta,
+                                config.one_euro_derivative_cutoff);
+    OneEuroFilter gaze_filter_y(config.one_euro_min_cutoff,
+                                config.one_euro_beta,
+                                config.one_euro_derivative_cutoff);
+    bool gaze_filter_initialized=false;
+    int gaze_hold_frames=0;
 
     ssne_tensor_t mirrored=create_tensor(640,480,SSNE_Y_8,SSNE_BUF_AI);
     while(true){
@@ -737,81 +1213,160 @@ void inference_thread_func(SCRFDGRAY* detector, PupilDetector* pupil_det,
                                         frame.captured_at);
 
         mirror_tensor(frame_pool[frame.pool_index],mirrored);
-        detector->Predict(&mirrored,det_result,0.4f);
-        if(det_result->boxes.empty()){
+        const PerfClock::time_point now=PerfClock::now();
+        face_tracker.Predict(now);
+
+        bool ran_detector=false;
+        if(face_tracker.ShouldRunDetector(now)){
+            ran_detector=true;
+            det_result.Clear();
+            detector->Predict(&mirrored,&det_result,0.4f);
+            g_perf_detector_runs.fetch_add(1,std::memory_order_relaxed);
+            if(!det_result.boxes.empty())
+                face_tracker.UpdateDetection(det_result.boxes[0],now);
+            else
+                face_tracker.UpdateDetectionMiss(now);
+        }
+        g_tracking_mode.store(face_tracker.Mode(),std::memory_order_release);
+
+        if(!face_tracker.Valid()){
             UpdateBlinkDetection(false,0.f);
-            // 人脸检测失败时也计入眨眼帧
-            static int blink_frames_nf=0;
-            blink_frames_nf++;
-            if(blink_frames_nf>30) blink_frames_nf=0;
+            left_history=PupilObservation();
+            right_history=PupilObservation();
+            gaze_filter_x.Reset();
+            gaze_filter_y.Reset();
+            gaze_filter_initialized=false;
+            gaze_hold_frames=0;
             if(g_visualizer){
-                std::vector<std::array<float,4>> test_boxes;
-                test_boxes.push_back({100.f,100.f,200.f,200.f});
-                test_boxes.push_back({300.f,200.f,400.f,300.f});
-                g_visualizer->Draw(test_boxes);
+                std::vector<std::array<float,4>> no_face_boxes;
+                no_face_boxes.push_back(
+                    {0.f,480.f,static_cast<float>(img_w),
+                     static_cast<float>(img_h*2)});
+                g_visualizer->Draw(no_face_boxes);
             }
             continue;
         }
 
-        auto& face=det_result->boxes[0];
+        const std::array<float,4> face=face_tracker.Box();
         float fw=face[2]-face[0], fh=face[3]-face[1];
-        float lcx,lcy,rcx,rcy;
-        if(det_result->landmarks_per_face>=2&&det_result->landmarks.size()>=2){
-            lcx=det_result->landmarks[0][0]; lcy=det_result->landmarks[0][1];
-            rcx=det_result->landmarks[1][0]; rcy=det_result->landmarks[1][1];
-        } else {
-            lcx=face[0]+fw*0.30f; lcy=face[1]+fh*0.35f;
-            rcx=face[0]+fw*0.70f; rcy=face[1]+fh*0.35f;
+        float lcx=face[0]+fw*0.30f,lcy=face[1]+fh*0.35f;
+        float rcx=face[0]+fw*0.70f,rcy=face[1]+fh*0.35f;
+        if(ran_detector&&det_result.landmarks_per_face>=2&&
+           det_result.landmarks.size()>=2){
+            lcx=det_result.landmarks[0][0];
+            lcy=det_result.landmarks[0][1];
+            rcx=det_result.landmarks[1][0];
+            rcy=det_result.landmarks[1][1];
         }
 
         auto lb=GetEyeBox(face,lcx,lcy,img_w,img_h);
         auto rb=GetEyeBox(face,rcx,rcy,img_w,img_h);
-        float lx,ly,rx,ry;
         const bool frame_ready=pupil_det->PrepareFrame(&mirrored);
-        const bool lok=frame_ready&&pupil_det->Detect(lb,lx,ly);
-        const bool rok=frame_ready&&pupil_det->Detect(rb,rx,ry);
-
-        // 眨眼检测：暗区像素比例
-        float dark_ratio=0.f;
-        const bool dark_ratio_valid=
-            frame_ready&&pupil_det->GetDarkRatio(lb,dark_ratio);
-        UpdateBlinkDetection(dark_ratio_valid,dark_ratio);
-
-        float ox=0,oy=0; bool has_gaze=false;
-        if(lok&&rok){
-            ox=((lx-lcx)+(rx-rcx))*0.5f/fw;
-            oy=((ly-lcy)+(ry-rcy))*0.5f/fh;
-            has_gaze=true;
-        } else if(lok){
-            ox=(lx-lcx)/fw; oy=(ly-lcy)/fh; has_gaze=true;
-        } else if(rok){
-            ox=(rx-rcx)/fw; oy=(ry-rcy)/fh; has_gaze=true;
+        const bool allow_model_recovery=pupil_det->PreferModel()||
+            face_tracker.Mode()!=TRACKING_STABLE;
+        PupilObservation left,right;
+        if(frame_ready){
+            left=pupil_det->Detect(lb,left_history.valid?&left_history:nullptr,
+                                   allow_model_recovery);
+            right=pupil_det->Detect(rb,right_history.valid?&right_history:nullptr,
+                                    allow_model_recovery);
         }
-        if(!has_gaze) continue;
+        if(left.used_model)
+            g_perf_model_recovery.fetch_add(1,std::memory_order_relaxed);
+        if(right.used_model)
+            g_perf_model_recovery.fetch_add(1,std::memory_order_relaxed);
 
-        {
+        if(left.valid) left_history=left;
+        else {
+            left_history.confidence*=0.70f;
+            if(left_history.confidence<0.20f) left_history.valid=false;
+        }
+        if(right.valid) right_history=right;
+        else {
+            right_history.confidence*=0.70f;
+            if(right_history.confidence<0.20f) right_history.valid=false;
+        }
+
+        face_tracker.UpdatePupilQuality(left,right);
+        g_tracking_mode.store(face_tracker.Mode(),std::memory_order_release);
+
+        float blink_dark_ratio=0.f;
+        bool blink_valid=false;
+        if(left.blink_valid&&right.blink_valid){
+            blink_dark_ratio=0.5f*(left.blink_dark_ratio+
+                                   right.blink_dark_ratio);
+            blink_valid=true;
+        } else if(left.blink_valid){
+            blink_dark_ratio=left.blink_dark_ratio;
+            blink_valid=true;
+        } else if(right.blink_valid){
+            blink_dark_ratio=right.blink_dark_ratio;
+            blink_valid=true;
+        }
+        UpdateBlinkDetection(blink_valid,blink_dark_ratio);
+
+        float ox=0.f,oy=0.f,gaze_confidence=0.f;
+        bool has_gaze=false;
+        const float left_ox=left.valid?(left.x-lcx)/fw:0.f;
+        const float left_oy=left.valid?(left.y-lcy)/fh:0.f;
+        const float right_ox=right.valid?(right.x-rcx)/fw:0.f;
+        const float right_oy=right.valid?(right.y-rcy)/fh:0.f;
+        if(left.valid&&right.valid){
+            const float weight_sum=left.confidence+right.confidence;
+            const float divergence=std::sqrt(
+                (left_ox-right_ox)*(left_ox-right_ox)+
+                (left_oy-right_oy)*(left_oy-right_oy));
+            if(divergence>0.12f&&
+               left.confidence>right.confidence*1.20f){
+                ox=left_ox; oy=left_oy;
+                gaze_confidence=left.confidence*0.80f;
+            } else if(divergence>0.12f&&
+                      right.confidence>left.confidence*1.20f){
+                ox=right_ox; oy=right_oy;
+                gaze_confidence=right.confidence*0.80f;
+            } else {
+                ox=(left.confidence*left_ox+right.confidence*right_ox)/
+                   std::max(0.001f,weight_sum);
+                oy=(left.confidence*left_oy+right.confidence*right_oy)/
+                   std::max(0.001f,weight_sum);
+                gaze_confidence=0.5f*weight_sum*(divergence>0.12f?0.55f:1.f);
+            }
+            has_gaze=true;
+        } else if(left.valid){
+            ox=left_ox; oy=left_oy;
+            gaze_confidence=left.confidence*0.75f;
+            has_gaze=true;
+        } else if(right.valid){
+            ox=right_ox; oy=right_oy;
+            gaze_confidence=right.confidence*0.75f;
+            has_gaze=true;
+        }
+
+        if(has_gaze&&gaze_confidence>=0.30f){
             std::lock_guard<std::mutex> lock(g_calib_mtx);
-            if(g_calibrator.is_calibrating&&lok&&rok)
+            if(g_calibrator.is_calibrating&&left.valid&&right.valid&&
+               gaze_confidence>=config.pupil_confidence_min)
                 g_calibrator.AddSample(ox,oy);
         }
 
-        float gnx,gny;
-        {
-            std::lock_guard<std::mutex> lock(g_calib_mtx);
-            g_calibrator.MapGaze(ox,oy,gnx,gny);
+        float sgx=g_last_sgx,sgy=g_last_sgy;
+        bool genuine_gaze=has_gaze&&gaze_confidence>=0.30f;
+        if(genuine_gaze){
+            float gnx,gny;
+            {
+                std::lock_guard<std::mutex> lock(g_calib_mtx);
+                g_calibrator.MapGaze(ox,oy,gnx,gny);
+            }
+            sgx=Clamp01(gaze_filter_x.Filter(gnx,now));
+            sgy=Clamp01(gaze_filter_y.Filter(gny,now));
+            gaze_filter_initialized=true;
+            gaze_hold_frames=0;
+            g_perf_gaze_valid.fetch_add(1,std::memory_order_relaxed);
+        } else if(gaze_filter_initialized&&gaze_hold_frames<2){
+            gaze_hold_frames++;
+        } else {
+            continue;
         }
-
-        gnx_hist.push_back(gnx); gny_hist.push_back(gny);
-        if((int)gnx_hist.size()>SW){
-            gnx_hist.erase(gnx_hist.begin());
-            gny_hist.erase(gny_hist.begin());
-        }
-        float sgx=0,sgy=0;
-        for(float v:gnx_hist) sgx+=v;
-        for(float v:gny_hist) sgy+=v;
-        sgx/=gnx_hist.size(); sgy/=gny_hist.size();
-        sgx=std::max(0.f,std::min(1.f,sgx));
-        sgy=std::max(0.f,std::min(1.f,sgy));
 
         g_last_sgx=sgx; g_last_sgy=sgy;
         GazeDirection dir=ClassifyGaze(sgx,sgy);
@@ -820,19 +1375,22 @@ void inference_thread_func(SCRFDGRAY* detector, PupilDetector* pupil_det,
         // OSD绘制：用VISUALIZER的Draw接口，只画矩形框
         if(g_visualizer){
             std::vector<std::array<float,4>> draw_boxes;
+            draw_boxes.reserve(32);
 
             // 人脸框
             draw_boxes.push_back(face);
 
             // 左瞳孔框
-            if(lok){
+            if(left.valid){
                 float ps=8.f;
-                draw_boxes.push_back({lx-ps,ly-ps,lx+ps,ly+ps});
+                draw_boxes.push_back(
+                    {left.x-ps,left.y-ps,left.x+ps,left.y+ps});
             }
             // 右瞳孔框
-            if(rok){
+            if(right.valid){
                 float ps=8.f;
-                draw_boxes.push_back({rx-ps,ry-ps,rx+ps,ry+ps});
+                draw_boxes.push_back(
+                    {right.x-ps,right.y-ps,right.x+ps,right.y+ps});
             }
 
             // 灰色画布（铺满下半屏）
@@ -884,7 +1442,6 @@ void inference_thread_func(SCRFDGRAY* detector, PupilDetector* pupil_det,
         }
     }
     release_tensor(mirrored);
-    delete det_result;
     printf("[Thread] Inference stopped\n");
 }
 
@@ -892,20 +1449,24 @@ int main(){
     uint8_t load_flag=0;
     int img_width=640, img_height=480;
     array<int,2> det_shape={640,480};
+    const AlgorithmConfig algorithm_config=AlgorithmConfig::Load();
     string path_det="/app_demo/app_assets/models/face_640x480.m1model";
     string path_pupil="/app_demo/app_assets/models/pupil_gap.m1model";
     const char* pupil_model_env=std::getenv("PUPIL_GAP_MODEL");
     if(pupil_model_env&&pupil_model_env[0]) path_pupil=pupil_model_env;
     bool enable_pupil_model=true;
+    bool prefer_pupil_model=false;
     const char* pupil_mode_env=std::getenv("PUPIL_DETECT_MODE");
-    if(pupil_mode_env&&std::string(pupil_mode_env)=="classic")
-        enable_pupil_model=false;
+    if(pupil_mode_env){
+        const std::string pupil_mode(pupil_mode_env);
+        if(pupil_mode=="classic") enable_pupil_model=false;
+        else if(pupil_mode=="model") prefer_pupil_model=true;
+    }
 
     if(ssne_initial()){fprintf(stderr,"SSNE init failed\n");return -1;}
+    algorithm_config.Print();
 
     array<int,2> img_shape={img_width,img_height};
-    const int dual_display_offset_y=480;
-
     // 用原始VISUALIZER，和原demo一样
     VISUALIZER visualizer;
     std::array<int,2> dual_shape={img_width, img_height*2};
@@ -921,7 +1482,8 @@ int main(){
     printf("[INFO] Face model OK\n");
 
     PupilDetector pupil_det;
-    pupil_det.Initialize(img_width,img_height,path_pupil,enable_pupil_model);
+    pupil_det.Initialize(img_width,img_height,path_pupil,
+                         enable_pupil_model,prefer_pupil_model);
     printf("[INFO] Pupil detector OK (%s)\n",pupil_det.ModeName());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -941,10 +1503,11 @@ int main(){
     std::thread inference_thread(inference_thread_func,
                                   &detector,&pupil_det,
                                   inference_frame_pool.data(),&free_frame_mask,
+                                  algorithm_config,
                                   img_width,img_height);
     std::thread listener_thread(keyboard_listener);
 
-    uint16_t num_frames=0;
+    uint64_t num_frames=0;
     ssne_tensor_t img_sensor[2];
     ssne_tensor_t output_sensor[2];
     output_sensor[0]=create_tensor(img_width,img_height*2,SSNE_Y_8,SSNE_BUF_AI);
