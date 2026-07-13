@@ -2,41 +2,44 @@ cmake_minimum_required(VERSION 3.0.0)
 
 project(ssne_ai_demo)
 
-# 引入路径配置文件
 include(cmake_config/Paths.cmake)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -O2")
-# 核心：禁用ABI变更提示
 add_compile_options(-Wno-psabi)
 
-add_executable(ssne_ai_demo ${PROJECT_SOURCE_DIR}/eye_track.cpp)
-add_executable(ssne_ai_demo_model ${PROJECT_SOURCE_DIR}/eye_track_model.cpp)
+include_directories(
+    ${M1_SDK_INC_DIR}
+    ${M1_SDK_INC_DIR}/smartsoc
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/task
+    ${CMAKE_SOURCE_DIR}/app
+)
 
-# 添加头文件目录
-include_directories(${M1_SDK_INC_DIR})
-include_directories(${M1_SDK_INC_DIR}/smartsoc)
+file(GLOB PLATFORM_SOURCES "${CMAKE_SOURCE_DIR}/src/*.cpp")
 
-# 定义调用目录来源
-set(SRC_DIR "src")
-set(TARGET $ENV{BASE_DIR}/target)
-include_directories(${CMAKE_SOURCE_DIR}/include)
-message([<mode>] "message to display" ${TARGET})
+add_library(eye_tracking_core
+    app/eye_tracking_app.cpp
+    task/eye_tracking_task.cpp
+    task/tracking_task.cpp
+    task/attention_task.cpp
+    ${PLATFORM_SOURCES}
+)
 
+target_link_libraries(eye_tracking_core
+    ${M1_SSNE_LIB}
+    ${M1_CMABUFFER_LIB}
+    ${M1_OSD_LIB}
+    ${M1_SSZLOG_LIB}
+    ${M1_ZLOG_LIB}
+    ${M1_EMB_LIB}
+)
 
-# 添加source文件夹下的所有cpp文件
-file(GLOB SRC_FILES "${CMAKE_SOURCE_DIR}/${SRC_DIR}/*.cpp")
-target_sources(ssne_ai_demo PRIVATE ${SRC_FILES})
-target_sources(ssne_ai_demo_model PRIVATE ${SRC_FILES})
+add_executable(ssne_ai_demo app/main.cpp)
+target_compile_definitions(ssne_ai_demo PRIVATE EYE_TRACK_DEFAULT_CLASSIC=1)
+target_link_libraries(ssne_ai_demo eye_tracking_core)
 
-foreach(APP_TARGET ssne_ai_demo ssne_ai_demo_model)
-    target_link_libraries(${APP_TARGET}
-                            ${M1_SSNE_LIB}
-                            ${M1_CMABUFFER_LIB}
-                            ${M1_OSD_LIB}
-                            ${M1_SSZLOG_LIB}
-                            ${M1_ZLOG_LIB}
-                            ${M1_EMB_LIB}
-    )
-endforeach()
+add_executable(ssne_ai_demo_model app/main.cpp)
+target_link_libraries(ssne_ai_demo_model eye_tracking_core)
 
 install(TARGETS ssne_ai_demo ssne_ai_demo_model DESTINATION bin)

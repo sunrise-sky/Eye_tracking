@@ -1,537 +1,385 @@
-# SSNE AI 演示项目
+# Eye Tracking Demo
 
 ## 项目概述
 
-本项目是基于 SmartSens SSNE (SmartSens Neural Engine) 的 AI 演示程序，主要展示**双目人脸检测**功能。项目使用 C++ 开发，集成了双目图像处理、AI 模型推理和可视化显示等功能。
+本项目是基于 SmartSens SSNE 的嵌入式眼动交互演示程序。程序从双路图像管线获取实时灰度图像，完成显示拼接、人脸定位、眼区生成、瞳孔检测、眨眼事件检测、注视点估计、九点校准和 OSD 反馈。
 
-### 双目架构说明
+当前版本已经从早期的单文件 demo 拆分为更清晰的三层结构：
 
-本演示使用**双目传感器**配置，两路图像上下拼接显示：
-- **第一路图像（右侧）**：显示在上半部分（Y坐标：0-479）
-- **第二路图像（左侧）**：显示在下半部分（Y坐标：480-959）
-- **显示分辨率**：640×960（每路图像640×480，上下拼接）
-- **坐标偏移**：第二路图像的检测结果Y坐标需加上480像素的显示偏移量
+- `app/`：应用层，负责 SSNE 生命周期、图像采集、显示、线程、队列、命令输入和性能日志。
+- `task/`：业务任务层，负责眼动算法流程编排，包括跟踪任务和注意力任务。
+- `src/` 与 `include/`：平台适配层，封装 SSNE、图像管线、SCRFD 人脸检测、OSD 绘制和公共工具。
 
-### 多线程非阻塞推理架构
+运行时主线程保持采集和显示链路稳定，算法线程只处理最新帧。当算法处理速度低于采集速度时，旧帧会被丢弃或替换，优先控制端到端延迟。
 
-为避免AI推理阻塞ISP debug图像拷贝流程，项目采用**多线程非阻塞推理架构**：
-- **主线程**：负责图像获取、ISP debug数据拷贝，保证实时性
-- **推理线程**：独立线程执行AI推理，不阻塞主循环
-- **图像队列**：线程间通过队列传递图像数据，最大队列长度为2帧
-- **同步机制**：使用互斥锁和条件变量实现线程安全的数据传递
+## 目录结构
 
-## 文件结构
-
+```text
+eye_track_demo/
+├── app/
+│   ├── main.cpp                 # 程序入口，根据目标选择默认瞳孔模式
+│   ├── eye_tracking_app.hpp     # EyeTrackingApp 对外接口
+│   └── eye_tracking_app.cpp     # 应用主流程、线程、队列、命令和性能统计
+├── task/
+│   ├── task_types.hpp           # 任务公共数据结构、状态枚举和配置
+│   ├── eye_tracking_task.hpp    # 聚合任务接口
+│   ├── eye_tracking_task.cpp    # 串联 TrackingTask 和 AttentionTask
+│   ├── tracking_task.hpp        # 跟踪任务接口
+│   ├── tracking_task.cpp        # 人脸跟踪、眼区、瞳孔检测和眨眼检测
+│   ├── attention_task.hpp       # 注意力任务接口
+│   └── attention_task.cpp       # 双眼融合、九点校准、One Euro 滤波和方向分类
+├── src/
+│   ├── pipeline_image.cpp       # 在线图像管线和双路图像获取
+│   ├── scrfd_gray.cpp           # SCRFD 灰度人脸检测模型封装
+│   ├── utils.cpp                # 检测结果排序、NMS 等工具
+│   └── osd-device.cpp           # OSD 设备绘制适配
+├── include/
+│   ├── common.hpp               # IMAGEPROCESSOR、SCRFDGRAY、检测结果结构
+│   ├── utils.hpp                # 工具函数和 VISUALIZER 声明
+│   ├── osd-device.hpp           # OSD 设备接口
+│   └── ...
+├── app_assets/
+│   ├── colorLUT.sscl            # OSD 颜色查找表
+│   └── models/
+│       ├── face_640x480.m1model # SCRFD 人脸检测模型
+│       └── pupil_gap.m1model    # 可选瞳孔恢复模型
+├── cmake_config/
+│   └── Paths.cmake              # SDK、库和工具链路径配置
+├── CMakeLists.txt               # 构建配置
+├── run.sh                       # 运行脚本，默认启动 ssne_ai_demo_model
+└── README.md
 ```
-ssne_ai_demo/
-├── eye_track.cpp              # 主演示程序 - 人脸检测演示
-├── include/                   # 头文件目录
-│   ├── common.hpp            # 公共数据结构定义
-│   └── utils.hpp             # 工具函数声明
-├── src/                       # 源代码目录
-│   ├── utils.cpp             # 工具函数实现
-│   ├── pipeline_image.cpp    # 图像处理管道实现
-│   └── scrfd_gray.cpp       # SCRFD人脸检测模型实现
-├── app_assets/               # 应用资源
-│   ├── models/              # AI模型文件
-│   │   └── face_640x480.m1model  # 人脸检测模型
-│   └── colorLUT.sscl        # 颜色查找表
-├── cmake_config/            # CMake配置
-│   └── Paths.cmake          # 路径配置文件
-├── scripts/                 # 脚本文件
-│   └── run.sh              # 运行脚本
-├── CMakeLists.txt          # CMake构建配置文件
-└── README.md              # 项目说明文档
+
+`task` 目录中的“任务”是业务模块，不代表独立线程。当前所有模型推理仍由单一算法线程顺序执行，避免多个线程同时争用 NPU 上下文。
+
+## 构建目标
+
+项目生成两个可执行程序，二者共享同一套应用层、任务层和平台适配代码，只是默认瞳孔检测模式不同。
+
+- `ssne_ai_demo`：默认使用 `classic` 传统瞳孔检测模式。
+- `ssne_ai_demo_model`：默认使用 `hybrid` 混合模式，也是 `run.sh` 默认启动目标。
+
+构建配置位于 `CMakeLists.txt`：
+
+- `eye_tracking_core` 静态/目标库包含应用实现、任务实现和平台源文件。
+- `ssne_ai_demo` 通过 `EYE_TRACK_DEFAULT_CLASSIC=1` 将默认模式设为 `classic`。
+- `ssne_ai_demo_model` 不设置该宏，因此默认模式为 `hybrid`。
+- 两个目标都链接 SSNE、CMA buffer、OSD、日志和嵌入式平台相关库。
+
+## 运行方式
+
+在目标设备或部署目录中执行：
+
+```sh
+./run.sh
 ```
 
-## 核心文件说明
+`run.sh` 默认启动 `./ssne_ai_demo_model`：
 
-### 1. 主程序文件
-- **eye_track.cpp**: 双目人脸检测主演示程序，实现完整的双目检测流程
-  - 初始化SSNE引擎
-  - 配置双目图像处理器和检测模型
-  - 启动独立推理线程（非阻塞AI推理）
-  - 主循环处理图像获取和ISP debug拷贝
-  - 通过队列向推理线程传递图像数据
-  - 双目图像上下拼接与显示
-  - 坐标转换（第二路图像需加480像素Y偏移）
-  - 优雅退出和资源释放
+```sh
+APP="${EYE_TRACK_APP:-./ssne_ai_demo_model}"
+chmod +x "$APP"
+exec "$APP"
+```
 
-### 2. 核心类定义
-- **common.hpp**: 定义核心数据结构
-  - `FaceDetectionResult`: 人脸检测结果结构体
-  - `IMAGEPROCESSOR`: 图像处理器类
-  - `SCRFDGRAY`: SCRFD人脸检测模型类
+如果需要启动传统瞳孔模式目标，可以覆盖环境变量：
 
-- **utils.hpp**: 工具函数声明
-  - 检测结果排序和NMS处理函数
+```sh
+EYE_TRACK_APP=./ssne_ai_demo ./run.sh
+```
 
-### 3. 实现文件
-- **src/utils.cpp**: 工具函数实现
-  - 归并排序算法
-  - 非极大值抑制(NMS)
+也可以直接覆盖瞳孔检测模式：
 
-- **src/pipeline_image.cpp**: 双目图像处理管道
-  - 双路图像获取和预处理
-  - GetDualImage接口实现
-  - 双目图像数据管理
+```sh
+PUPIL_DETECT_MODE=classic ./run.sh
+PUPIL_DETECT_MODE=hybrid ./run.sh
+PUPIL_DETECT_MODE=model ./run.sh
+```
 
-- **src/scrfd_gray.cpp**: SCRFD模型实现
-  - 模型初始化和推理
-  - 后处理算法
-  - 锚点框生成
-
-### 4. 配置文件
-- **CMakeLists.txt**: 构建配置文件
-  - 定义编译选项和依赖库
-  - 指定源文件和头文件路径
-  - 链接SSNE相关库
-
-- **cmake_config/Paths.cmake**: 路径配置
-  - SDK路径设置
-  - 库文件路径配置
-
-### 5. 资源文件
-- **app_assets/models/face_640x480.m1model**: 人脸检测AI模型
-  - 输入尺寸: 640×480
-  - 支持灰度图像
-  - 输出人脸边界框和置信度
-
-- **app_assets/colorLUT.sscl**: 颜色查找表
-  - 用于显示的颜色配置
-
-### 6. 脚本文件
-- **scripts/run.sh**: 运行脚本
-  - 环境变量设置
-  - 程序启动命令
-
-## Demo 流程图
-
-以下是完整的双目人脸检测流程（多线程非阻塞架构）：
+## 总体流程
 
 ```mermaid
 flowchart TD
-    A[开始] --> INIT[初始化配置]
-    INIT --> INIT1[参数配置<br/>图像尺寸、模型路径、双目偏移]
-    INIT1 --> INIT2[SSNE初始化]
-    INIT2 --> INIT3[双目图像处理器初始化]
-    INIT3 --> INIT4[人脸检测模型初始化]
-    INIT4 --> INIT5[启动推理线程<br/>独立线程执行AI推理]
-    INIT5 --> INIT6[ISP Debug配置<br/>双路图像缓冲区初始化]
-    
-    INIT6 --> MAIN_LOOP[主循环开始]
-    MAIN_LOOP --> B[获取双目图像<br/>GetDualImage获取两路图像]
-    B --> COPY[ISP Debug数据拷贝<br/>奇偶帧交替拷贝到缓冲区]
-    COPY --> LOAD[启动ISP Debug Load<br/>主循环核心任务-不被阻塞]
-    LOAD --> QUEUE{图像队列是否已满?}
-    QUEUE -->|未满| PUSH[将双路图像放入队列<br/>notify推理线程]
-    QUEUE -->|已满| SKIP[跳过本帧推理<br/>避免阻塞主循环]
-    PUSH --> NEXT[帧计数+1]
-    SKIP --> NEXT
-    NEXT --> CHECK{继续处理?}
-    CHECK -->|是| MAIN_LOOP
-    CHECK -->|否| STOP_THREAD[停止推理线程]
-    
-    INIT5 -.启动.-> INFER_THREAD[推理线程]
-    INFER_THREAD --> WAIT[等待队列中的图像]
-    PUSH -.通知.-> WAIT
-    WAIT --> GET_IMG{队列有图像?}
-    GET_IMG -->|是| POP[从队列取出双路图像]
-    GET_IMG -->|否,且收到停止信号| THREAD_EXIT[推理线程退出]
-    POP --> D1[第一路模型推理<br/>右侧相机 NPU加速]
-    POP --> D2[第二路模型推理<br/>左侧相机 NPU加速]
-    D1 --> E1[后处理1]
-    D2 --> E2[后处理2]
-    E1 --> E1A[解码坐标1]
-    E2 --> E2A[解码坐标2]
-    E1A --> E1B[过滤低分结果1]
-    E2A --> E2B[过滤低分结果2]
-    E1B --> E1C[NMS非极大值抑制1]
-    E2B --> E2C[NMS非极大值抑制2]
-    E1C --> F1{第一路检测到人脸?}
-    E2C --> F2{第二路检测到人脸?}
-    F1 -->|是| G1[坐标转换1<br/>Y坐标不变 0-479]
-    F1 -->|否| I1[第一路无检测结果]
-    F2 -->|是| G2[坐标转换2<br/>Y坐标加480像素偏移 480-959]
-    F2 -->|否| I2[第二路无检测结果]
-    G1 --> H1[结果输出1<br/>打印第一路检测信息]
-    G2 --> H2[结果输出2<br/>打印第二路检测信息]
-    H1 --> WAIT
-    H2 --> WAIT
-    I1 --> WAIT
-    I2 --> WAIT
-    
-    STOP_THREAD --> JOIN[等待推理线程完成]
-    THREAD_EXIT -.join.-> JOIN
-    JOIN --> RELEASE[资源释放]
-    RELEASE --> RELEASE1[释放检测器资源]
-    RELEASE1 --> RELEASE2[释放双目图像处理器资源]
-    RELEASE2 --> RELEASE3[SSNE释放]
-    RELEASE3 --> K[结束]
+    A[程序启动] --> B[SSNE 初始化]
+    B --> C[读取环境变量并生成 TaskConfig]
+    C --> D[初始化 OSD、图像管线和 EyeTrackingTask]
+    D --> E[创建显示 tensor 和算法帧池]
+    E --> F[启动算法线程和命令输入线程]
+
+    F --> G[主线程循环采集双路图像]
+    G --> H[镜像处理并上下拼接到 640x960 显示缓冲]
+    H --> I[启动 ISP debug 显示刷新]
+    I --> J{算法队列是否可写}
+    J -->|可写| K[拷贝最新帧到帧池并入队]
+    J -->|不可写| L[丢弃或替换旧帧]
+    K --> G
+    L --> G
+
+    F --> M[算法线程等待最新帧]
+    M --> N[TrackingTask: 人脸、眼区、瞳孔、眨眼]
+    N --> O[AttentionTask: 融合、校准、滤波、方向]
+    O --> P[Render: 绘制人脸框、瞳孔、注视点和校准提示]
+    P --> M
 ```
 
-### 流程说明
+## 线程模型
 
-#### 1. 初始化配置 (`eye_track.cpp:124-168`)
+### 主线程
 
-- **参数配置** (`eye_track.cpp:125-136`)
-  - 配置单路图像尺寸（640×480）
-  - 配置模型输入尺寸（640×480）
-  - 配置模型文件路径
-  - 配置双目显示偏移量（480像素）
+主线程由 `EyeTrackingApp::Run()` 驱动，核心职责是图像采集和显示刷新：
 
-- **SSNE初始化** (`eye_track.cpp:142-145`)
-  - 初始化SSNE引擎
+1. 调用 `IMAGEPROCESSOR::GetDualImage()` 从双路 sensor 获取图像。
+2. 对双路图像分别做镜像处理。
+3. 使用 `copy_double_tensor_buffer()` 将两路图像上下拼接到 640x960 输出缓冲。
+4. 通过 `start_isp_debug_load()` 推送显示刷新。
+5. 将最新算法帧放入帧池队列。
+6. 每秒输出一次 `[PERF]` 性能日志。
 
-- **双目图像处理器初始化** (`eye_track.cpp:147-154`)
-  - 初始化双目图像处理器，配置图像尺寸
-  - 支持GetDualImage双路图像获取
+显示层仍展示双路图像的上下拼接结果。当前算法输入使用第一路图像，第二路图像保留在显示链路中，便于观察、调试或后续扩展。
 
-- **人脸检测模型初始化** (`eye_track.cpp:156-161`)
-  - 初始化SCRFD人脸检测模型
-  - 加载模型文件
-  - 生成anchor boxes
+### 算法线程
 
-- **启动推理线程** (`eye_track.cpp:166-168`)
-  - 创建独立推理线程 `inference_thread`
-  - 线程函数：`inference_thread_func`
-  - 传递检测器指针和双目显示偏移量参数
+算法线程由 `InferenceLoop()` 驱动，只处理队列中的最新帧：
 
-- **ISP Debug配置** (`eye_track.cpp:170-184`)
-  - 创建双路图像输出缓冲区（640×960）
-  - 配置奇偶帧交替机制
-  - 初始化ISP调试接口
+1. 等待主线程提交 `InferenceFrame`。
+2. 响应命令标记，例如重新校准、重置、清除眨眼标记。
+3. 构造 `FramePacket` 并调用 `EyeTrackingTask::Process()`。
+4. 统计 SCRFD 调用次数、瞳孔模型恢复次数、有效 gaze 次数和延迟。
+5. 调用 `Render()` 将算法结果转换为 OSD 矩形。
+6. 归还帧池 slot。
 
-#### 2. 主处理循环 (`eye_track.cpp:188-227`) - 非阻塞设计
+算法队列深度为 1，帧池大小为 2。主线程入队时如果发现队列中已有旧帧，会优先移除旧帧，只保留最新帧参与算法处理。
 
-**主循环职责**：只负责图像获取和ISP debug拷贝，不执行AI推理（避免阻塞）
+### 命令输入线程
 
-- **获取双目图像** (`eye_track.cpp:192`)
-  - 通过 `GetDualImage()` 同时获取两路相机图像（每路640×480）
-  
-- **ISP Debug数据拷贝** (`eye_track.cpp:194-207`)
-  - 根据奇偶帧标志交替拷贝数据
-  - 调用 `copy_double_tensor_buffer()` 将双路图像拷贝到输出缓冲区
-  - **启动ISP数据加载（主循环核心任务，不能被阻塞）**
+命令输入线程读取标准输入，支持运行时控制：
 
-- **图像入队操作** (`eye_track.cpp:209-224`) - 非阻塞
-  - 获取互斥锁保护队列操作
-  - **队列未满**：将双路图像放入队列，通知推理线程处理
-  - **队列已满**：跳过本帧推理，避免阻塞主循环
-  - 释放锁后主循环继续下一帧
+- `q`：退出程序。
+- `c`：重新开始九点校准。
+- `n`：输出当前状态，包括跟踪模式、人脸状态、注视状态和校准进度。
+- `r`：清除眨眼标记。
+- `x`：重置跟踪与校准状态。
 
-#### 3. 推理线程处理 (`eye_track.cpp:40-119`) - 异步执行
+## 核心模块说明
 
-**推理线程职责**：从队列获取图像并执行AI推理，不影响主循环
+### 1. 应用层：EyeTrackingApp
 
-- **等待图像数据** (`eye_track.cpp:55-72`)
-  - 使用条件变量等待队列中的图像
-  - 收到通知后获取互斥锁
-  - 从队列取出图像数据
-  - 释放锁后执行推理
+`app/eye_tracking_app.cpp` 是当前 demo 的运行骨架，负责把平台输入、算法任务和显示输出连接起来。
 
-- **双路模型推理** (`eye_track.cpp:78-80`)
-  - 第一路：`detector->Predict(&img_pair.img1, det_result1, 0.4f)` 处理右侧相机图像
-  - 第二路：`detector->Predict(&img_pair.img2, det_result2, 0.4f)` 处理左侧相机图像
-  - 在NPU上执行推理，获取检测结果
+主要职责：
 
-- **第一路后处理** (`eye_track.cpp:82-95`)
-  - **判断检测结果**: 检查是否检测到人脸
-  - **坐标转换**: 
-    - 处理右侧相机图像的检测结果
-    - Y坐标不变（显示在上半部分：0-479）
-    - X坐标保持不变
-  - **结果输出**: 打印检测框坐标和帧ID
-  - **无检测处理**: 未检测到时输出提示信息
+- 初始化和释放 SSNE。
+- 读取环境变量并生成 `TaskConfig`。
+- 初始化 `VISUALIZER`、`IMAGEPROCESSOR` 和 `EyeTrackingTask`。
+- 管理显示 tensor、镜像 tensor 和算法帧池。
+- 启动主循环、算法线程和命令输入线程。
+- 维护最新结果、眨眼标记和 OSD 绘制。
+- 输出性能日志。
 
-- **第二路后处理** (`eye_track.cpp:97-112`)
-  - **判断检测结果**: 检查是否检测到人脸
-  - **坐标转换**: 
-    - 处理左侧相机图像的检测结果
-    - **Y坐标加480像素偏移**（显示在下半部分：480-959）
-    - X坐标保持不变
-  - **结果输出**: 打印检测框坐标和帧ID
-  - **无检测处理**: 未检测到时输出提示信息
+`Render()` 会把算法结果映射为 OSD 矩形：
 
-#### 4. 优雅退出 (`eye_track.cpp:229-246`)
+- 顶部区域绘制人脸框、左右瞳孔框和校准目标。
+- 底部区域绘制归一化注视点和眨眼标记。
+- 左上角用九宫格小方块表示当前注视方向。
+- 校准过程中用七段数字显示当前校准点和采样数量。
 
-- **停止推理线程** (`eye_track.cpp:233-240`)
-  - 设置停止标志 `stop_inference = true`
-  - 通知条件变量唤醒推理线程
-  - 推理线程检测到停止信号后退出循环
+### 2. 聚合任务：EyeTrackingTask
 
-- **等待线程完成** (`eye_track.cpp:242-246`)
-  - 调用 `inference_thread.join()` 等待推理线程安全退出
-  - 确保所有推理任务完成
+`task/eye_tracking_task.cpp` 是任务编排层。它不直接实现算法细节，而是固定执行顺序：
 
-#### 5. 资源释放 (`eye_track.cpp:248-260`)
-
-- **释放检测器资源** (`eye_track.cpp:252`)
-  - 释放模型和tensor资源（推理线程内的检测结果已自动释放）
-
-- **释放双目图像处理器资源** (`eye_track.cpp:253`)
-  - 关闭双目pipeline通道
-
-- **SSNE释放** (`eye_track.cpp:255-258`)
-  - 释放SSNE引擎资源
-
-## 数据流说明
-
-本项目的图像处理流程分为**双目图像采集**、**在线处理（Online Processing）**和**离线处理（Offline Processing）**三个部分，通过不同的pipeline协同工作，实现高效的双目AI推理。
-
-### 1. 双目图像架构
-
-本演示使用双目传感器配置，两路图像独立处理后上下拼接显示：
-
-#### 双目成像结构
-```
-原始传感器输出（双路独立）:
-┌────────────────┐
-│  右侧相机       │  第一路 (img_sensor[0])
-│  640×480       │  → 检测结果1 (det_result1)
-└────────────────┘
-┌────────────────┐
-│  左侧相机       │  第二路 (img_sensor[1])
-│  640×480       │  → 检测结果2 (det_result2)
-└────────────────┘
-
-显示输出（上下拼接）:
-┌────────────────┐
-│  右侧相机       │  Y: 0-479
-│  640×480       │  (坐标不变)
-├────────────────┤
-│  左侧相机       │  Y: 480-959
-│  640×480       │  (坐标+480)
-└────────────────┘
-总分辨率: 640×960
+```text
+FramePacket
+  -> TrackingTask::Process()
+  -> AttentionTask::Process()
+  -> EyeTrackingResult
 ```
 
-#### 双目数据流关键点
-1. **独立采集**: 通过`GetDualImage()`同时获取两路图像数据
-2. **模型推理**: 两路图像分别进行AI推理，互不干扰
-3. **坐标转换**: 
-   - 第一路（右侧）：Y坐标不变，显示在0-479区域
-   - 第二路（左侧）：Y坐标加480，显示在480-959区域
-4. **拼接显示**: 双路结果合并到640×960的显示缓冲区
+`TrackingTask` 输出 `TrackingState`，包含人脸、眼区、瞳孔、眨眼等低层状态。`AttentionTask` 基于该状态继续生成 `AttentionState`，包含注视点、置信度、方向、校准状态和注意力状态。
 
-### 2. 在线处理（Online Processing）- IMAGEPROCESSOR
+### 3. 跟踪任务：TrackingTask
 
-在线处理主要在 `IMAGEPROCESSOR` 类中完成，负责从传感器获取图像并进行实时预处理：
+`task/tracking_task.cpp` 包含眼动跟踪的主要算法逻辑。
 
-#### 初始化阶段
-```cpp
-// 在 IMAGEPROCESSOR::Initialize 中
-OnlineSetCrop(kPipeline0, 0, 720, 370, 910);    // 设置裁剪参数
-OnlineSetOutputImage(kPipeline0, format_online, 720, 540);         // 设置输出图像尺寸
-OpenOnlinePipeline(kPipeline0);                                     // 打开pipe0通道
-```
-**接口说明：**
-- **OnlineSetCrop**: 设置图像裁剪参数，定义裁剪区域边界
-  - 函数声明：`int OnlineSetCrop(PipelineIdType pipeline_id, uint16_t x1, uint16_t x2, uint16_t y1, uint16_t y2);`
-  - 参数说明：
-    - `pipeline_id`: pipeline标识（kPipeline0/kPipeline1）
-    - `x1`: 左边界坐标（包含）
-    - `x2`: 右边界坐标（不包含）
-    - `y1`: 上边界坐标（包含）
-    - `y2`: 下边界坐标（不包含）
-  - 返回值：0表示设置成功，-1表示设置异常
-  - 约束条件：最大宽度8192像素，最大高度8192像素，最小高度1像素
-  - 注意：裁剪尺寸需要与输出图像尺寸匹配
+#### 人脸检测与跟踪
 
-- **OnlineSetOutputImage**: 设置输出图像参数，包括尺寸和数据类型
-  - 函数声明：`int OnlineSetOutputImage(PipelineIdType pipeline_id, uint8_t dtype, uint16_t width, uint16_t height);`
-  - 参数说明：
-    - `pipeline_id`: pipeline标识（kPipeline0/kPipeline1）
-    - `dtype`: 输出图像数据类型
-    - `width`: 输出图像宽度（像素）
-    - `height`: 输出图像高度（像素）
-  - 返回值：0表示设置成功，-1表示设置异常
-  - 约束条件：最大宽度8192像素，最大高度8192像素，最小高度1像素
-  - 注意：输出尺寸需要与Crop的尺寸匹配
+人脸检测使用 `SCRFDGRAY` 模型，默认模型路径为：
 
-- **OpenOnlinePipeline**: 打开并初始化指定的pipeline通道
-  - 函数声明：`int OpenOnlinePipeline(PipelineIdType pipeline_id);`
-  - 参数说明：
-    - `pipeline_id`: pipeline标识（kPipeline0/kPipeline1）
-  - 返回值：0表示打开成功，-1表示打开异常
-  - 功能特点：初始化Image_Capture模块，准备数据传输
-
-
-
-#### 图像获取阶段
-```cpp
-// 在 GetDualImage 函数中
-GetImageData(img_sensor[0], kPipeline0, kSensor0, 0);  // 获取第一路图像（右侧相机）
-GetImageData(img_sensor[1], kPipeline0, kSensor1, 0);  // 获取第二路图像（左侧相机）
-```
-**接口说明：**
-- **GetDualImage**: 同时获取双目传感器的两路图像数据
-  - 内部调用两次`GetImageData`分别获取两个传感器的数据
-  - 参数说明：
-    - `img_sensor[0]`: 第一路图像tensor（右侧相机）
-    - `img_sensor[1]`: 第二路图像tensor（左侧相机）
-  - 返回值：通过引用参数返回两路图像数据
-  - 功能特点：确保两路图像时间同步
-
-#### 资源释放阶段
-```cpp
-// 在 IMAGEPROCESSOR::Release 中
-CloseOnlinePipeline(kPipeline0);  // 关闭pipe0（裁剪图像通道）
+```text
+/app_demo/app_assets/models/face_640x480.m1model
 ```
 
-**接口说明：**
-- **CloseOnlinePipeline**: 关闭指定的pipeline通道并重置默认参数
-  - 函数声明：`int CloseOnlinePipeline(PipelineIdType pipeline_id);`
-  - 参数说明：
-    - `pipeline_id`: pipeline标识（kPipeline0/kPipeline1）
-  - 返回值：0表示关闭成功，-1表示关闭异常
-  - 功能特点：释放相关资源，重置为默认状态
+为了降低 NPU 压力，人脸检测不是每帧都执行，而是通过 `FaceTracker` 控制多速率刷新：
 
-### 2. 离线处理（Offline Processing）- SCRFDGRAY
+- `REACQUIRE`：重捕状态。没有稳定人脸或连续低置信时，尽快运行 SCRFD。
+- `DEGRADED`：降级状态。人脸存在但瞳孔质量不稳定，按较高频率刷新 SCRFD。
+- `TRACKING`：稳定跟踪状态。瞳孔连续稳定后，按较低频率刷新 SCRFD，中间帧使用预测框。
 
-离线处理在 `SCRFDGRAY` 类中完成，主要负责AI模型的输入准备和推理。本演示中对双路图像分别进行独立的离线处理。
+默认频率：
 
-#### 预处理管道获取
-```cpp
-// 在 common.hpp 中
-AiPreprocessPipe pipe_offline = GetAIPreprocessPipe();                 // 获取离线预处理管道
+- `SCRFD_TRACKING_HZ=30`
+- `SCRFD_DEGRADED_HZ=60`
+
+当检测器返回人脸框时，`FaceTracker` 会使用平滑更新框位置和速度；当检测失败或瞳孔质量连续较差时，会退回 `DEGRADED` 或 `REACQUIRE`。
+
+#### 眼区生成
+
+有有效人脸后，跟踪任务根据人脸框和关键点生成左右眼区域：
+
+- 如果 SCRFD 输出关键点，则优先使用前两个关键点作为左右眼中心。
+- 如果没有关键点，则按人脸框比例估计左右眼中心。
+- `GetEyeBox()` 根据眼中心和人脸宽度裁剪出左右眼 ROI。
+
+#### 瞳孔检测
+
+瞳孔检测由内部 `PupilDetector` 完成，支持三种模式：
+
+- `classic`：只使用传统图像算法。
+- `hybrid`：优先使用传统算法，低置信或非稳定状态时使用模型恢复。
+- `model`：优先使用模型，必要时回退传统算法。
+
+传统算法主要步骤：
+
+1. 将当前帧拷贝到 Linux buffer。
+2. 在眼区 ROI 内统计灰度直方图和平均亮度。
+3. 通过低灰度百分位和平均亮度生成瞳孔阈值。
+4. 如果上一帧瞳孔稳定，则围绕历史位置缩小搜索区域。
+5. 对暗像素做加权质心，得到瞳孔位置。
+6. 根据对比度、暗像素比例、紧凑度、时间连续性和边缘距离计算置信度。
+
+可选模型 `pupil_gap.m1model` 用于恢复低置信瞳孔结果。模型输入为 224x224 眼区图像，输出归一化瞳孔坐标。模型输出会再映射回原始图像坐标。
+
+#### 眨眼检测
+
+`BlinkDetector` 使用左右眼暗像素比例估计开闭眼状态：
+
+- 动态维护睁眼基线。
+- 连续闭眼若干帧后进入闭眼状态。
+- 重新睁眼后根据持续时间判断是否形成有效眨眼事件。
+- 有效眨眼持续时间范围为 80 ms 到 800 ms。
+
+发生眨眼事件且当前 gaze 有效时，应用层会在底部 gaze 区域记录一个眨眼标记。
+
+### 4. 注意力任务：AttentionTask
+
+`task/attention_task.cpp` 负责把瞳孔状态转换为归一化注视状态。
+
+#### 双眼融合
+
+任务先将左右瞳孔位置转换为相对眼中心、相对人脸尺寸的偏移：
+
+```text
+left_x  = (left_pupil_x  - left_eye_center_x)  / face_width
+left_y  = (left_pupil_y  - left_eye_center_y)  / face_height
+right_x = (right_pupil_x - right_eye_center_x) / face_width
+right_y = (right_pupil_y - right_eye_center_y) / face_height
 ```
-**接口说明：**
-- **GetAIPreprocessPipe**: 创建并获取AI预处理管道句柄
-  - 函数声明：`AiPreprocessPipe GetAIPreprocessPipe();`
-  - 参数说明：无参数
-  - 返回值：AiPreprocessPipe结构体变量，用于后续的图像预处理操作
-  - 功能特点：初始化AI预处理管道，为离线图像处理做准备
 
-#### 模型输入准备
-```cpp
-// 在 SCRFDGRAY::Initialize 中
-inputs[0] = create_tensor(det_width, det_height, SSNE_Y_8, SSNE_BUF_AI);  // 创建模型输入tensor
+如果双眼都有效，则按置信度加权融合；如果双眼分歧较大，则选择置信度明显更高的一侧。如果只有单眼有效，则使用单眼结果并降低置信度。
+
+#### 九点校准
+
+校准点为 3x3 九宫格：
+
+```text
+(0.1,0.1) (0.5,0.1) (0.9,0.1)
+(0.1,0.5) (0.5,0.5) (0.9,0.5)
+(0.1,0.9) (0.5,0.9) (0.9,0.9)
 ```
 
-#### 图像预处理执行
-```cpp
-// 在 RunAiPreprocessPipe 中
-int ret = RunAiPreprocessPipe(pipe_offline, img_sensor[0], inputs[0]);  
+每个点采集 30 个有效样本。采集完成后，`GazeCalibrator` 对水平和垂直方向分别拟合线性映射参数，把原始瞳孔偏移映射到 0 到 1 的注视坐标。
+
+程序初始化后会自动开始一次校准，也可以运行时输入 `c` 重新校准。
+
+#### One Euro 滤波
+
+注视点输出经过 One Euro Filter 平滑，默认参数：
+
+- `ONE_EURO_MIN_CUTOFF=3.0`
+- `ONE_EURO_BETA=0.6`
+- `ONE_EURO_D_CUTOFF=1.0`
+
+该滤波器在低速时增强稳定性，在快速移动时提高响应速度。
+
+#### 方向分类
+
+最终注视点被分成九个方向：
+
+- `Center`
+- `Left` / `Right` / `Up` / `Down`
+- `LeftUp` / `RightUp` / `LeftDown` / `RightDown`
+
+分类阈值为归一化坐标的 0.35 和 0.65。方向为 `Center` 且 gaze 有效时，`attentive` 被置为 true。
+
+## 数据结构
+
+主要状态定义在 `task/task_types.hpp`。
+
+### FramePacket
+
+`FramePacket` 是算法线程输入：
+
+- `image`：当前帧 tensor 指针。
+- `frame_id`：帧序号。
+- `captured_at`：采集时间戳，用于端到端延迟统计。
+
+### TrackingState
+
+`TrackingState` 是跟踪任务输出：
+
+- `face`：人脸框、置信度、跟踪模式和检测器是否运行。
+- `left_eye_box` / `right_eye_box`：左右眼 ROI。
+- `left_eye_center` / `right_eye_center`：左右眼中心。
+- `left_pupil` / `right_pupil`：瞳孔位置、速度、置信度、是否使用模型。
+- `blink`：眨眼计数、闭眼状态、事件和持续时间。
+
+### AttentionState
+
+`AttentionState` 是注意力任务输出：
+
+- `gaze`：归一化注视坐标。
+- `confidence`：注视置信度。
+- `direction`：九方向分类结果。
+- `calibration`：当前校准状态。
+- `gaze_valid`：注视点是否有效。
+- `attentive`：是否注视中心区域。
+
+### EyeTrackingResult
+
+`EyeTrackingResult` 聚合完整结果：
+
+```text
+EyeTrackingResult
+├── TrackingState tracking
+└── AttentionState attention
 ```
 
-**接口说明：**
-- **RunAiPreprocessPipe**: 执行AI图像预处理操作（双路分别执行）
-  - 函数声明：`int RunAiPreprocessPipe(AiPreprocessPipe handle, ssne_tensor_t input_image, ssne_tensor_t output_image);`
-  - 参数说明：
-    - `handle`: AiPreprocessPipe结构体变量（预处理管道句柄）
-    - `input_image`: 输入图像tensor（640×480）
-    - `output_image`: 输出图像tensor（模型输入）
-  - 返回值：错误状态码，具体含义参考宏定义
-  - 功能特点：执行图像resize、格式转换等预处理操作，为AI模型准备输入数据
-  - 双目处理：两路图像使用同一个预处理管道，分别执行预处理
+## 图像与显示
 
-#### 预处理管道释放
-```cpp
-// 在 SCRFDGRAY 析构函数中
-ReleaseAIPreprocessPipe(pipe_offline);                                 // 释放预处理管道资源
+图像管线位于 `src/pipeline_image.cpp`：
+
+- `IMAGEPROCESSOR::Initialize()` 配置在线输出为 640x480、`SSNE_Y_8` 灰度格式。
+- `OpenDualSnrOnline(kPipeline0)` 打开双路 sensor 在线管线。
+- `GetDualImage()` 使用 `GetDualImageData()` 获取双路图像。
+- `Release()` 关闭在线管线。
+
+显示输出为 640x960：
+
+```text
+┌────────────────────────┐
+│ 第一层图像 / 跟踪结果   │  y: 0-479
+├────────────────────────┤
+│ 第二层图像 / gaze 画布  │  y: 480-959
+└────────────────────────┘
 ```
 
-**接口说明：**
-- **ReleaseAIPreprocessPipe**: 释放AI预处理管道资源
-  - 函数声明：`int ReleaseAIPreprocessPipe(AiPreprocessPipe handle);`
-  - 参数说明：
-    - `handle`: 目标AiPreprocessPipe结构体变量（预处理管道句柄）
-  - 返回值：0表示释放成功
-  - 功能特点：释放预处理管道占用的资源，避免内存泄漏
+OSD 绘制由 `VISUALIZER` 和 `OsdDevice` 完成。应用层只传入矩形列表，底层负责转换为 OSD 四边形并刷新图层。
 
+## 环境变量配置
 
-### 3. 双目数据流详细说明
-
-#### 阶段1: 双目图像采集与在线处理
-1. **双路原始图像获取**: 从双目传感器同时获取两路图像（每路640×480）
-2. **在线处理**: 使用`GetDualImage`接口同时获取两路图像数据
-3. **ISP Debug配置**: 
-   - 创建640×960的输出缓冲区（用于上下拼接显示）
-   - 配置奇偶帧交替机制
-   - 通过`copy_double_tensor_buffer`拷贝双路图像到显示缓冲区
-
-#### 阶段2: 双路离线预处理与AI推理
-1. **第一路处理**:
-   - 使用`RunAiPreprocessPipe`预处理img_sensor[0]（右侧相机）
-   - 调用`detector.Predict(&img_sensor[0], det_result1, 0.4f)`执行推理
-   - 得到det_result1检测结果
-
-2. **第二路处理**:
-   - 使用`RunAiPreprocessPipe`预处理img_sensor[1]（左侧相机）
-   - 调用`detector.Predict(&img_sensor[1], det_result2, 0.4f)`执行推理
-   - 得到det_result2检测结果
-
-#### 阶段3: 双路后处理与坐标转换
-1. **第一路后处理**（右侧相机）:
-   - 执行NMS、置信度过滤等后处理
-   - 坐标转换：Y坐标保持不变（显示范围：0-479）
-   - 输出日志：`[INFO] Right Face detected`
-
-2. **第二路后处理**（左侧相机）:
-   - 执行NMS、置信度过滤等后处理
-   - **坐标转换：Y坐标加480像素偏移**（显示范围：480-959）
-   - 输出日志：`[INFO] Left Face detected`
-
-#### 阶段4: 双目图像拼接与显示
-1. **图像拼接**: 两路检测结果合并到640×960的显示缓冲区
-2. **上下布局**:
-   - 上半部分（Y: 0-479）：右侧相机图像及检测框
-   - 下半部分（Y: 480-959）：左侧相机图像及检测框
-3. **同步显示**: 双路结果同时更新显示
-
-## 技术特点
-
-1. **多线程非阻塞架构**: 
-   - 主线程专注于图像获取和ISP debug拷贝，保证实时性
-   - 推理线程异步执行AI推理，不阻塞主循环
-   - 使用图像队列和同步机制实现线程间通信
-   
-2. **双目AI检测**: 使用双目传感器配置，实现双路人脸检测
-
-3. **AI模型**: 使用SCRFD (Sample and Computation Redistribution for Face Detection) 算法
-
-4. **图像处理**: 支持双目图像同步获取、独立处理和拼接显示
-
-5. **坐标转换**: 自动处理双目图像的坐标映射和显示偏移
-
-6. **ISP Debug支持**: 支持奇偶帧交替的图像数据输出，不被AI推理阻塞
-
-7. **性能优化**: 
-   - 使用SSNE硬件加速AI推理
-   - 队列控制避免内存占用过多（最大2帧缓存）
-   - 队列满时跳过推理，优先保证主循环流畅
-
-## 使用说明
-
-项目通过CMake构建，支持交叉编译到目标嵌入式平台。主要功能包括：
-- 双目实时人脸检测（多线程非阻塞架构）
-- 主线程处理图像获取和ISP debug拷贝（不被AI推理阻塞）
-- 推理线程异步执行双路检测
-- 双路检测结果独立处理
-- 双目图像上下拼接显示（640×960）
-- 坐标自动转换（第二路加480像素Y偏移）
-- 优雅退出和资源管理
-
-演示程序会持续处理双目图像帧，主线程保证ISP debug的实时性，推理线程在后台异步处理人脸检测，在检测到人脸时分别在上下两个显示区域显示检测结果。
-
-## eye_track_model 多速率算法
-
-`ssne_ai_demo_model` 是默认运行程序。它将每帧瞳孔和注视点更新与低频
-SCRFD 人脸框刷新解耦，并包含以下状态：
-
-- `TRACKING`：瞳孔稳定，SCRFD 默认 30 Hz；
-- `DEGRADED`：单眼或低置信度，SCRFD 默认 60 Hz；
-- `REACQUIRE`：人脸或双眼连续丢失，SCRFD 对最新帧连续重捕。
-
-传统瞳孔算法使用灰度直方图、自适应阈值、局部搜索和置信度评分。
-`pupil_gap.m1model` 默认仅在低置信度时用于恢复；注视坐标使用 One Euro
-Filter，默认参数为 `min_cutoff=3.0`、`beta=0.6`、`d_cutoff=1.0`。
-
-运行参数均可通过环境变量覆盖：
+运行参数可以通过环境变量覆盖：
 
 ```sh
-export PUPIL_DETECT_MODE=hybrid       # hybrid / classic / model
+export PUPIL_DETECT_MODE=hybrid       # classic / hybrid / model
 export PUPIL_GAP_MODEL=/app_demo/app_assets/models/pupil_gap.m1model
 export SCRFD_TRACKING_HZ=30
 export SCRFD_DEGRADED_HZ=60
@@ -539,9 +387,96 @@ export PUPIL_CONFIDENCE_MIN=0.45
 export ONE_EURO_MIN_CUTOFF=3.0
 export ONE_EURO_BETA=0.6
 export ONE_EURO_D_CUTOFF=1.0
-./scripts/run.sh
+./run.sh
 ```
 
-程序每秒输出一次 `[PERF]`，其中 `epp_fps` 为完成处理的帧率，`gaze` 为
-有效注视结果数，`scrfd` 为实际人脸模型调用数，`model_recovery` 为瞳孔模型
-恢复次数，并同时输出队列深度、平均/最大端到端延迟和当前跟踪状态。
+参数说明：
+
+- `PUPIL_DETECT_MODE`：瞳孔检测模式。`classic` 只用传统算法，`hybrid` 传统优先并用模型恢复，`model` 模型优先。
+- `PUPIL_GAP_MODEL`：可选瞳孔模型路径。
+- `SCRFD_TRACKING_HZ`：稳定跟踪状态下 SCRFD 刷新频率。
+- `SCRFD_DEGRADED_HZ`：降级状态下 SCRFD 刷新频率。
+- `PUPIL_CONFIDENCE_MIN`：瞳孔质量阈值，影响跟踪状态和校准采样。
+- `ONE_EURO_MIN_CUTOFF`：One Euro 滤波基础截止频率。
+- `ONE_EURO_BETA`：速度自适应强度。
+- `ONE_EURO_D_CUTOFF`：导数滤波截止频率。
+
+## 模型文件
+
+设备侧模型名称保持不变：
+
+```text
+app_assets/models/face_640x480.m1model
+app_assets/models/pupil_gap.m1model
+```
+
+默认代码中的设备路径为：
+
+```text
+/app_demo/app_assets/models/face_640x480.m1model
+/app_demo/app_assets/models/pupil_gap.m1model
+```
+
+如果部署目录不同，需要通过环境变量或代码配置同步调整路径。
+
+## 性能日志
+
+程序每秒输出一次 `[PERF]`：
+
+```text
+[PERF] capture_fps=... enqueue_fps=... drop=... epp_fps=...
+       gaze=... scrfd=... model_recovery=... queue=...
+       latency_ms_avg=... latency_ms_max=... mode=...
+```
+
+字段含义：
+
+- `capture_fps`：主线程采集帧率。
+- `enqueue_fps`：成功提交给算法线程的帧率。
+- `drop`：最近一秒丢弃或替换的帧数。
+- `epp_fps`：算法线程完成处理的帧率。
+- `gaze`：最近一秒有效注视结果数量。
+- `scrfd`：最近一秒 SCRFD 实际调用次数。
+- `model_recovery`：最近一秒瞳孔模型恢复调用次数。
+- `queue`：当前算法队列深度，设计上最大为 1。
+- `latency_ms_avg`：最近一秒算法端到端平均延迟。
+- `latency_ms_max`：最近一秒算法端到端最大延迟。
+- `mode`：当前人脸跟踪状态，可能为 `REACQUIRE`、`DEGRADED` 或 `TRACKING`。
+
+## 交互命令
+
+运行后终端会提示：
+
+```text
+Commands: q=quit c=calibrate n=status r=clear marks x=reset
+```
+
+命令说明：
+
+- `q`：请求退出，主线程和算法线程会顺序停止并释放资源。
+- `c`：重新开始九点校准。
+- `n`：打印当前状态。
+- `r`：清除已经记录的眨眼标记。
+- `x`：重置人脸跟踪、瞳孔历史、眨眼状态和校准状态。
+
+## 资源释放
+
+退出时 `EyeTrackingApp::Shutdown()` 会按初始化的反序释放资源：
+
+1. 停止算法线程和输入线程。
+2. 释放 `EyeTrackingTask`。
+3. 释放显示 tensor 和算法帧池 tensor。
+4. 关闭 `IMAGEPROCESSOR` 在线管线。
+5. 释放 `VISUALIZER` 和 OSD 资源。
+6. 调用 `ssne_release()` 释放 SSNE。
+
+这种顺序可以避免算法线程仍在访问 tensor 或模型资源时提前释放底层设备对象。
+
+## 设计特点
+
+1. **结构清晰**：应用框架、业务任务和平台适配分离，后续替换算法或显示实现更直接。
+2. **最新帧优先**：算法队列容量为 1，旧帧会被替换，避免延迟持续累积。
+3. **多速率检测**：SCRFD 调用频率随跟踪状态变化，稳定时降低检测频率，降级或重捕时提高检测频率。
+4. **混合瞳孔检测**：传统算法负责常规帧，模型用于低置信恢复或模型优先模式。
+5. **校准与滤波内聚**：注视点映射、九点校准和 One Euro 滤波集中在 `AttentionTask`。
+6. **可观测性较好**：运行日志同时输出采集、入队、算法、延迟、模型调用和跟踪状态。
