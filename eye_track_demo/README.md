@@ -45,8 +45,9 @@ eye_track_demo/
 │       └── pupil_gap.m1model    # 可选瞳孔恢复模型
 ├── cmake_config/
 │   └── Paths.cmake              # SDK、库和工具链路径配置
+├── scripts/
+│   └── run.sh                   # 运行脚本，优先启动模型目标并兼容经典目标
 ├── CMakeLists.txt               # 构建配置
-├── run.sh                       # 运行脚本，默认启动 ssne_ai_demo_model
 └── README.md
 ```
 
@@ -57,7 +58,7 @@ eye_track_demo/
 项目生成两个可执行程序，二者共享同一套应用层、任务层和平台适配代码，只是默认瞳孔检测模式不同。
 
 - `ssne_ai_demo`：默认使用 `classic` 传统瞳孔检测模式。
-- `ssne_ai_demo_model`：默认使用 `hybrid` 混合模式，也是 `run.sh` 默认启动目标。
+- `ssne_ai_demo_model`：默认使用 `hybrid` 混合模式，也是 `scripts/run.sh` 优先启动的目标。
 
 构建配置位于 `CMakeLists.txt`：
 
@@ -71,29 +72,27 @@ eye_track_demo/
 在目标设备或部署目录中执行：
 
 ```sh
-./run.sh
+sh ./scripts/run.sh
 ```
 
-`run.sh` 默认启动 `./ssne_ai_demo_model`：
+`scripts/run.sh` 优先启动 `./ssne_ai_demo_model`；如果 SDK 部署包只安装了经典目标，则自动回退到 `./ssne_ai_demo`。也可以通过 `EYE_TRACK_APP` 显式指定：
 
 ```sh
-APP="${EYE_TRACK_APP:-./ssne_ai_demo_model}"
-chmod +x "$APP"
-exec "$APP"
+EYE_TRACK_APP=./ssne_ai_demo_model sh ./scripts/run.sh
 ```
 
 如果需要启动传统瞳孔模式目标，可以覆盖环境变量：
 
 ```sh
-EYE_TRACK_APP=./ssne_ai_demo ./run.sh
+EYE_TRACK_APP=./ssne_ai_demo sh ./scripts/run.sh
 ```
 
 也可以直接覆盖瞳孔检测模式：
 
 ```sh
-PUPIL_DETECT_MODE=classic ./run.sh
-PUPIL_DETECT_MODE=hybrid ./run.sh
-PUPIL_DETECT_MODE=model ./run.sh
+PUPIL_DETECT_MODE=classic sh ./scripts/run.sh
+PUPIL_DETECT_MODE=hybrid sh ./scripts/run.sh
+PUPIL_DETECT_MODE=model sh ./scripts/run.sh
 ```
 
 ## 总体流程
@@ -387,7 +386,7 @@ export PUPIL_CONFIDENCE_MIN=0.45
 export ONE_EURO_MIN_CUTOFF=3.0
 export ONE_EURO_BETA=0.6
 export ONE_EURO_D_CUTOFF=1.0
-./run.sh
+sh ./scripts/run.sh
 ```
 
 参数说明：
