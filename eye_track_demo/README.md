@@ -21,13 +21,13 @@ eye_track_demo/
 │   ├── eye_tracking_app.hpp     # EyeTrackingApp 对外接口
 │   └── eye_tracking_app.cpp     # 应用主流程、线程、队列、命令和性能统计
 ├── task/
-│   ├── task_types.hpp           # 任务公共数据结构、状态枚举和配置
-│   ├── eye_tracking_task.hpp    # 聚合任务接口
-│   ├── eye_tracking_task.cpp    # 串联 TrackingTask 和 AttentionTask
-│   ├── tracking_task.hpp        # 跟踪任务接口
-│   ├── tracking_task.cpp        # 人脸跟踪、眼区、瞳孔检测和眨眼检测
-│   ├── attention_task.hpp       # 注意力任务接口
-│   └── attention_task.cpp       # 双眼融合、九点校准、One Euro 滤波和方向分类
+│   ├── types.hpp                # 任务公共数据结构、状态枚举和配置
+│   ├── eye_tracking.hpp         # 聚合任务接口
+│   ├── eye_tracking.cpp         # 串联 TrackingTask 和 AttentionTask
+│   ├── tracking.hpp             # 跟踪任务接口
+│   ├── tracking.cpp             # 人脸跟踪、眼区、瞳孔检测和眨眼检测
+│   ├── attention.hpp            # 注意力任务接口
+│   └── attention.cpp            # 双眼融合、九点校准、One Euro 滤波和方向分类
 ├── src/
 │   ├── pipeline_image.cpp       # 在线图像管线和双路图像获取
 │   ├── scrfd_gray.cpp           # SCRFD 灰度人脸检测模型封装
@@ -185,7 +185,7 @@ flowchart TD
 
 ### 2. 聚合任务：EyeTrackingTask
 
-`task/eye_tracking_task.cpp` 是任务编排层。它不直接实现算法细节，而是固定执行顺序：
+`task/eye_tracking.cpp` 是任务编排层。它不直接实现算法细节，而是固定执行顺序：
 
 ```text
 FramePacket
@@ -198,7 +198,7 @@ FramePacket
 
 ### 3. 跟踪任务：TrackingTask
 
-`task/tracking_task.cpp` 包含眼动跟踪的主要算法逻辑。
+`task/tracking.cpp` 包含眼动跟踪的主要算法逻辑。
 
 #### 人脸检测与跟踪
 
@@ -261,7 +261,7 @@ FramePacket
 
 ### 4. 注意力任务：AttentionTask
 
-`task/attention_task.cpp` 负责把瞳孔状态转换为归一化注视状态。
+`task/attention.cpp` 负责把瞳孔状态转换为归一化注视状态。
 
 #### 双眼融合
 
@@ -312,7 +312,7 @@ right_y = (right_pupil_y - right_eye_center_y) / face_height
 
 ## 数据结构
 
-主要状态定义在 `task/task_types.hpp`。
+主要状态定义在 `task/types.hpp`。
 
 ### FramePacket
 

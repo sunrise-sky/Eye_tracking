@@ -20,9 +20,9 @@ file(GLOB PLATFORM_SOURCES "${CMAKE_SOURCE_DIR}/src/*.cpp")
 
 add_library(eye_tracking_core
     app/eye_tracking_app.cpp
-    task/eye_tracking_task.cpp
-    task/tracking_task.cpp
-    task/attention_task.cpp
+    task/eye_tracking.cpp
+    task/tracking.cpp
+    task/attention.cpp
     ${PLATFORM_SOURCES}
 )
 

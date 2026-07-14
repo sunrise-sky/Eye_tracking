@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#include "task_types.hpp"
+#include "types.hpp"
 
 namespace eye_track {
 

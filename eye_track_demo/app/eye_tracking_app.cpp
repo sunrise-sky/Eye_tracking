@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "../include/utils.hpp"
-#include "../task/eye_tracking_task.hpp"
+#include "../task/eye_tracking.hpp"
 
 namespace eye_track {
 namespace {

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "attention_task.hpp"
-#include "tracking_task.hpp"
+#include "attention.hpp"
+#include "tracking.hpp"
 
 namespace eye_track {
 
