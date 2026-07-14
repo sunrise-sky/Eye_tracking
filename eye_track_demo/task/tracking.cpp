@@ -1,5 +1,7 @@
 #include "tracking.hpp"
 
+#include "kalman.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -707,6 +709,69 @@ PupilState PublishPupil(const PupilObservation& observation,
     return state;
 }
 
+float PupilMeasurementVariance(float confidence) {
+    const float normalized = Clamp01(confidence);
+    const float standard_deviation = 2.2f + 7.5f * (1.f - normalized);
+    return standard_deviation * standard_deviation;
+}
+
+PupilState PublishFilteredPupil(const PupilObservation& observation,
+                                ConstantVelocityKalman2D& filter,
+                                const PupilState& previous,
+                                const RectF& eye_box,
+                                int missed_frames,
+                                const TrackingConfig& config,
+                                TimePoint now, TimePoint previous_time) {
+    if (!config.pupil_kalman_enabled) {
+        return PublishPupil(observation, previous, missed_frames,
+                            now, previous_time);
+    }
+
+    PupilState state;
+    const float min_x = eye_box[0];
+    const float min_y = eye_box[1];
+    const float max_x = std::max(min_x, eye_box[2] - 1.f);
+    const float max_y = std::max(min_y, eye_box[3] - 1.f);
+
+    if (observation.valid) {
+        if (!filter.initialized()) {
+            filter.Initialize(observation.x, observation.y, now, 9.f, 2500.f);
+        } else {
+            filter.Predict(now, config.pupil_kalman_process_noise);
+            filter.Correct(observation.x, observation.y,
+                           PupilMeasurementVariance(observation.confidence));
+        }
+        filter.ClampPosition(min_x, min_y, max_x, max_y);
+        state.position = filter.Position();
+        state.velocity = filter.Velocity();
+        state.confidence = observation.confidence;
+        state.dark_ratio = observation.blink_dark_ratio;
+        state.blink_measurement_valid = observation.blink_valid;
+        state.used_model = observation.used_model;
+        state.valid = true;
+        state.missed_frames = 0;
+        return state;
+    }
+
+    if (filter.initialized() &&
+        missed_frames <= std::max(0, config.pupil_prediction_hold_frames)) {
+        filter.Predict(now, config.pupil_kalman_process_noise);
+        filter.ClampPosition(min_x, min_y, max_x, max_y);
+        const float decay = std::pow(0.55f, static_cast<float>(
+            std::max(1, missed_frames)));
+        state.position = filter.Position();
+        state.velocity = filter.Velocity();
+        state.confidence = previous.valid ? previous.confidence * decay : 0.f;
+        state.valid = state.confidence >= 0.15f;
+        state.missed_frames = missed_frames;
+        return state;
+    }
+
+    filter.Reset();
+    state.missed_frames = missed_frames;
+    return state;
+}
+
 }  // namespace
 
 class TrackingTask::Impl {
@@ -769,6 +834,8 @@ public:
             state.blink = blink_detector_.Update(false, 0.f);
             left_history_ = PupilObservation();
             right_history_ = PupilObservation();
+            left_pupil_filter_.Reset();
+            right_pupil_filter_.Reset();
             return state;
         }
 
@@ -827,10 +894,12 @@ public:
 
         if (!left.valid) left_missed_++; else left_missed_ = 0;
         if (!right.valid) right_missed_++; else right_missed_ = 0;
-        state.left_pupil = PublishPupil(left, last_left_state_, left_missed_,
-                                        now, previous_pupil_time_);
-        state.right_pupil = PublishPupil(right, last_right_state_, right_missed_,
-                                         now, previous_pupil_time_);
+        state.left_pupil = PublishFilteredPupil(
+            left, left_pupil_filter_, last_left_state_, state.left_eye_box,
+            left_missed_, config_, now, previous_pupil_time_);
+        state.right_pupil = PublishFilteredPupil(
+            right, right_pupil_filter_, last_right_state_, state.right_eye_box,
+            right_missed_, config_, now, previous_pupil_time_);
         if (state.left_pupil.valid) last_left_state_ = state.left_pupil;
         if (state.right_pupil.valid) last_right_state_ = state.right_pupil;
         previous_pupil_time_ = now;
@@ -859,6 +928,8 @@ public:
         last_right_state_ = PupilState();
         left_missed_ = 0;
         right_missed_ = 0;
+        left_pupil_filter_.Reset();
+        right_pupil_filter_.Reset();
         face_confidence_ = 0.f;
         blink_detector_.Reset();
     }
@@ -892,6 +963,8 @@ private:
     PupilObservation right_history_;
     PupilState last_left_state_;
     PupilState last_right_state_;
+    ConstantVelocityKalman2D left_pupil_filter_;
+    ConstantVelocityKalman2D right_pupil_filter_;
     int left_missed_ = 0;
     int right_missed_ = 0;
     TimePoint previous_pupil_time_ = Clock::now();

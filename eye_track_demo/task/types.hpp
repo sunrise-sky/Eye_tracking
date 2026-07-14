@@ -117,6 +117,9 @@ struct TrackingConfig {
     float scrfd_tracking_hz = 30.f;
     float scrfd_degraded_hz = 60.f;
     float pupil_confidence_min = 0.45f;
+    bool pupil_kalman_enabled = true;
+    float pupil_kalman_process_noise = 1800.f;
+    int pupil_prediction_hold_frames = 3;
     PupilMode pupil_mode = PupilMode::Hybrid;
     std::string face_model = "/app_demo/app_assets/models/face_640x480.m1model";
     std::string pupil_model = "/app_demo/app_assets/models/pupil_gap.m1model";
@@ -127,6 +130,10 @@ struct AttentionConfig {
     float one_euro_min_cutoff = 3.f;
     float one_euro_beta = 0.6f;
     float one_euro_derivative_cutoff = 1.f;
+    bool gaze_kalman_enabled = true;
+    float gaze_kalman_process_noise = 8.f;
+    float gaze_kalman_measurement_noise = 0.0004f;
+    int gaze_prediction_hold_frames = 4;
 };
 
 struct TaskConfig {

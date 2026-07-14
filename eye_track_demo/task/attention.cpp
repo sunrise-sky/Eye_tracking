@@ -1,5 +1,7 @@
 #include "attention.hpp"
 
+#include "kalman.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -227,6 +229,14 @@ GazeDirection ClassifyGaze(float x, float y) {
     return GazeDirection::Center;
 }
 
+float GazeMeasurementVariance(const AttentionConfig& config, float confidence) {
+    const float base_std = std::sqrt(std::max(1e-7f,
+                                             config.gaze_kalman_measurement_noise));
+    const float scale = 1.f + 4.f * (1.f - Clamp01(confidence));
+    const float standard_deviation = base_std * scale;
+    return standard_deviation * standard_deviation;
+}
+
 }  // namespace
 
 class AttentionTask::Impl {
@@ -319,16 +329,47 @@ public:
 
         if (has_gaze && confidence >= 0.30f) {
             const Point2f mapped = calibrator_.Map(raw_x, raw_y);
-            last_gaze_[0] = Clamp01(filter_x_->Filter(mapped[0], tracking.timestamp));
-            last_gaze_[1] = Clamp01(filter_y_->Filter(mapped[1], tracking.timestamp));
+            Point2f predicted = mapped;
+            if (config_.gaze_kalman_enabled) {
+                if (!gaze_filter_.initialized()) {
+                    gaze_filter_.Initialize(mapped[0], mapped[1],
+                                            tracking.timestamp,
+                                            0.0004f, 0.16f);
+                } else {
+                    gaze_filter_.Predict(tracking.timestamp,
+                                         config_.gaze_kalman_process_noise);
+                    gaze_filter_.Correct(
+                        mapped[0], mapped[1],
+                        GazeMeasurementVariance(config_, confidence));
+                }
+                gaze_filter_.ClampPosition(0.f, 0.f, 1.f, 1.f);
+                predicted = gaze_filter_.Position();
+            }
+            last_gaze_[0] = Clamp01(filter_x_->Filter(predicted[0],
+                                                      tracking.timestamp));
+            last_gaze_[1] = Clamp01(filter_y_->Filter(predicted[1],
+                                                      tracking.timestamp));
             filter_initialized_ = true;
             hold_frames_ = 0;
+            last_confidence_ = confidence;
             state.gaze_valid = true;
             state.confidence = confidence;
-        } else if (filter_initialized_ && hold_frames_ < 2) {
+        } else if (filter_initialized_ &&
+                   hold_frames_ < config_.gaze_prediction_hold_frames) {
             hold_frames_++;
+            if (config_.gaze_kalman_enabled && gaze_filter_.initialized()) {
+                gaze_filter_.Predict(tracking.timestamp,
+                                     config_.gaze_kalman_process_noise);
+                gaze_filter_.ClampPosition(0.f, 0.f, 1.f, 1.f);
+                const Point2f predicted = gaze_filter_.Position();
+                last_gaze_[0] = Clamp01(filter_x_->Filter(predicted[0],
+                                                          tracking.timestamp));
+                last_gaze_[1] = Clamp01(filter_y_->Filter(predicted[1],
+                                                          tracking.timestamp));
+            }
             state.gaze_valid = true;
-            state.confidence = 0.f;
+            state.confidence = last_confidence_ * std::pow(
+                0.50f, static_cast<float>(hold_frames_));
         } else {
             state.calibration = calibrator_.State();
             return state;
@@ -350,6 +391,7 @@ public:
     void Reset() {
         calibrator_.Reset();
         last_gaze_ = Point2f{{0.5f, 0.5f}};
+        last_confidence_ = 0.f;
         ResetFilter();
     }
 
@@ -357,15 +399,19 @@ private:
     void ResetFilter() {
         if (filter_x_) filter_x_->Reset();
         if (filter_y_) filter_y_->Reset();
+        gaze_filter_.Reset();
         filter_initialized_ = false;
         hold_frames_ = 0;
+        last_confidence_ = 0.f;
     }
 
     AttentionConfig config_;
     GazeCalibrator calibrator_;
     std::unique_ptr<OneEuroFilter> filter_x_;
     std::unique_ptr<OneEuroFilter> filter_y_;
+    ConstantVelocityKalman2D gaze_filter_;
     Point2f last_gaze_{{0.5f, 0.5f}};
+    float last_confidence_ = 0.f;
     int hold_frames_ = 0;
     bool filter_initialized_ = false;
 };

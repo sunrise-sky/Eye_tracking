@@ -38,6 +38,12 @@ TaskConfig LoadTaskConfig(const std::string& default_mode) {
         "SCRFD_DEGRADED_HZ", 60.f, 10.f, 180.f);
     config.tracking.pupil_confidence_min = ReadEnvFloat(
         "PUPIL_CONFIDENCE_MIN", 0.45f, 0.1f, 0.9f);
+    config.tracking.pupil_kalman_enabled =
+        ReadEnvFloat("PUPIL_KALMAN_ENABLED", 1.f, 0.f, 1.f) > 0.5f;
+    config.tracking.pupil_kalman_process_noise = ReadEnvFloat(
+        "PUPIL_KALMAN_PROCESS_NOISE", 1800.f, 0.f, 12000.f);
+    config.tracking.pupil_prediction_hold_frames = static_cast<int>(
+        ReadEnvFloat("PUPIL_PREDICTION_HOLD_FRAMES", 3.f, 0.f, 12.f));
     config.attention.pupil_confidence_min =
         config.tracking.pupil_confidence_min;
     config.attention.one_euro_min_cutoff = ReadEnvFloat(
@@ -46,6 +52,14 @@ TaskConfig LoadTaskConfig(const std::string& default_mode) {
         "ONE_EURO_BETA", 0.6f, 0.f, 5.f);
     config.attention.one_euro_derivative_cutoff = ReadEnvFloat(
         "ONE_EURO_D_CUTOFF", 1.f, 0.1f, 20.f);
+    config.attention.gaze_kalman_enabled =
+        ReadEnvFloat("GAZE_KALMAN_ENABLED", 1.f, 0.f, 1.f) > 0.5f;
+    config.attention.gaze_kalman_process_noise = ReadEnvFloat(
+        "GAZE_KALMAN_PROCESS_NOISE", 8.f, 0.f, 80.f);
+    config.attention.gaze_kalman_measurement_noise = ReadEnvFloat(
+        "GAZE_KALMAN_MEASUREMENT_NOISE", 0.0004f, 0.000001f, 0.02f);
+    config.attention.gaze_prediction_hold_frames = static_cast<int>(
+        ReadEnvFloat("GAZE_PREDICTION_HOLD_FRAMES", 4.f, 0.f, 12.f));
 
     const char* pupil_model = std::getenv("PUPIL_GAP_MODEL");
     if (pupil_model && pupil_model[0])
@@ -60,10 +74,15 @@ TaskConfig LoadTaskConfig(const std::string& default_mode) {
 
     printf("[ALGO] pupil_mode=%s scrfd_tracking_hz=%.1f "
            "scrfd_degraded_hz=%.1f pupil_conf_min=%.2f "
+           "pupil_kf=%d pupil_pred=%d gaze_kf=%d gaze_pred=%d "
            "one_euro=(%.2f,%.2f,%.2f)\n",
            mode.c_str(), config.tracking.scrfd_tracking_hz,
            config.tracking.scrfd_degraded_hz,
            config.tracking.pupil_confidence_min,
+           config.tracking.pupil_kalman_enabled ? 1 : 0,
+           config.tracking.pupil_prediction_hold_frames,
+           config.attention.gaze_kalman_enabled ? 1 : 0,
+           config.attention.gaze_prediction_hold_frames,
            config.attention.one_euro_min_cutoff,
            config.attention.one_euro_beta,
            config.attention.one_euro_derivative_cutoff);

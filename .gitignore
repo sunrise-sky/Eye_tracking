@@ -3,3 +3,4 @@
 /zImage.smartsens-m1-evb
 training/.lpw_cache/
 training/outputs/
+training/__pycache__/
