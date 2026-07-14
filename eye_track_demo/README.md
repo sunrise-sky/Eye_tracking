@@ -68,6 +68,12 @@ eye_track_demo/
 - `ssne_ai_demo_model` 不设置该宏，因此默认模式为 `hybrid`。
 - 两个目标都链接 SSNE、CMA buffer、OSD、日志和嵌入式平台相关库。
 
+如果需要修改默认构建目标或默认模式，主要位置如下：
+
+- `CMakeLists.txt`：修改 `ssne_ai_demo` / `ssne_ai_demo_model` 目标，以及 `EYE_TRACK_DEFAULT_CLASSIC` 编译宏。
+- `app/main.cpp`：根据 `EYE_TRACK_DEFAULT_CLASSIC` 选择 `classic` 或 `hybrid` 默认模式，并传入 `EyeTrackingApp`。
+- `app/eye_tracking_app.cpp`：`LoadTaskConfig()` 读取环境变量并生成 `TaskConfig`。
+
 ## 运行方式
 
 在目标设备或部署目录中执行：
@@ -95,6 +101,12 @@ PUPIL_DETECT_MODE=classic sh ./scripts/run.sh
 PUPIL_DETECT_MODE=hybrid sh ./scripts/run.sh
 PUPIL_DETECT_MODE=model sh ./scripts/run.sh
 ```
+
+运行入口和模式覆盖相关文件：
+
+- `scripts/run.sh`：选择实际启动的可执行程序，默认优先运行 `./ssne_ai_demo_model`。
+- `app/eye_tracking_app.cpp`：读取 `PUPIL_DETECT_MODE`，将 `classic` / `hybrid` / `model` 映射为 `PupilMode`。
+- `task/types.hpp`：定义 `PupilMode` 枚举和 `TrackingConfig::pupil_mode` 默认值。
 
 ## 总体流程
 
@@ -236,6 +248,13 @@ FramePacket
 - `classic`：只使用传统图像算法。
 - `hybrid`：优先使用传统算法，低置信或非稳定状态时使用模型恢复。
 - `model`：优先使用模型，必要时回退传统算法。
+
+如果需要修改三种模式的实际行为，主要位置如下：
+
+- `task/types.hpp`：`PupilMode` 定义三种可选模式：`Classic`、`Hybrid`、`Model`。
+- `task/tracking.cpp`：`EyeTrackingTask::Initialize()` 根据 `pupil_mode` 设置是否启用模型、是否模型优先。
+- `task/tracking.cpp`：`PupilDetector::Detect()` 实现传统检测、模型优先、低置信模型恢复等具体策略。
+- `task/tracking.cpp`：`EyeTrackingTask::Process()` 中的 `allow_model` 判断控制混合模式下什么时候允许调用模型恢复。
 
 传统算法主要步骤：
 
@@ -458,6 +477,13 @@ sh ./scripts/run.sh
 - `ONE_EURO_MIN_CUTOFF`：One Euro 滤波基础截止频率。
 - `ONE_EURO_BETA`：速度自适应强度。
 - `ONE_EURO_D_CUTOFF`：导数滤波截止频率。
+
+模式和模型路径对应的代码修改位置：
+
+- `app/eye_tracking_app.cpp`：`LoadTaskConfig()` 读取 `PUPIL_DETECT_MODE` 和 `PUPIL_GAP_MODEL`。
+- `task/types.hpp`：`TrackingConfig::pupil_model` 保存默认瞳孔模型路径。
+- `task/tracking.cpp`：`PupilDetector::InitializeModel()` 加载 `pupil_gap.m1model` 并准备模型输入 tensor。
+- `task/tracking.cpp`：`PupilDetector::DetectWithModel()` 执行模型推理并把归一化输出映射回图像坐标。
 
 ## 模型文件
 
