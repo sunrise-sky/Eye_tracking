@@ -27,7 +27,8 @@ eye_track_demo/
 │   ├── tracking.hpp             # 跟踪任务接口
 │   ├── tracking.cpp             # 人脸跟踪、眼区、瞳孔检测和眨眼检测
 │   ├── attention.hpp            # 注意力任务接口
-│   └── attention.cpp            # 双眼融合、九点校准、One Euro 滤波和方向分类
+│   ├── attention.cpp            # 双眼融合、九点校准、Kalman/One Euro 滤波和方向分类
+│   └── kalman.hpp               # 常速度二维 Kalman 滤波器
 ├── src/
 │   ├── pipeline_image.cpp       # 在线图像管线和双路图像获取
 │   ├── scrfd_gray.cpp           # SCRFD 灰度人脸检测模型封装
@@ -116,7 +117,7 @@ flowchart TD
 
     F --> M[算法线程等待最新帧]
     M --> N[TrackingTask: 人脸、眼区、瞳孔、眨眼]
-    N --> O[AttentionTask: 融合、校准、滤波、方向]
+    N --> O[AttentionTask: 融合、校准、预测、滤波、方向]
     O --> P[Render: 绘制人脸框、瞳孔、注视点和校准提示]
     P --> M
 ```
@@ -247,6 +248,29 @@ FramePacket
 
 可选模型 `pupil_gap.m1model` 用于恢复低置信瞳孔结果。模型输入为 224x224 眼区图像，输出归一化瞳孔坐标。模型输出会再映射回原始图像坐标。
 
+#### 瞳孔 Kalman 滤波与短时预测
+
+瞳孔检测结果发布前会经过左右眼独立的常速度 Kalman Filter。滤波状态为二维位置和二维速度：
+
+```text
+state = [x, y, vx, vy]
+```
+
+当当前帧有有效瞳孔测量时，流程为：
+
+1. 按时间间隔预测当前瞳孔位置。
+2. 根据检测置信度生成测量噪声，置信度越低，测量噪声越大。
+3. 使用检测到的瞳孔坐标校正滤波状态。
+4. 将位置限制在当前眼区 ROI 内，避免预测点漂出眼区。
+
+当当前帧瞳孔检测失败但滤波器仍有历史状态时，系统会在少量帧内继续发布预测位置，并按帧数衰减置信度。这样可以降低眨眼边缘、运动模糊或模型偶发低置信造成的注视点跳变。超过预测保留帧数后，滤波器会重置，等待新的有效瞳孔测量。
+
+默认参数：
+
+- `PUPIL_KALMAN_ENABLED=1`
+- `PUPIL_KALMAN_PROCESS_NOISE=1800`
+- `PUPIL_PREDICTION_HOLD_FRAMES=3`
+
 #### 眨眼检测
 
 `BlinkDetector` 使用左右眼暗像素比例估计开闭眼状态：
@@ -289,9 +313,30 @@ right_y = (right_pupil_y - right_eye_center_y) / face_height
 
 程序初始化后会自动开始一次校准，也可以运行时输入 `c` 重新校准。
 
+#### Gaze Kalman 预测
+
+九点校准把原始瞳孔偏移映射为 0 到 1 的注视坐标后，`AttentionTask` 会先用常速度 Kalman Filter 对 gaze 做预测和校正。该滤波器同样使用二维位置和速度状态：
+
+```text
+state = [gaze_x, gaze_y, gaze_vx, gaze_vy]
+```
+
+有有效 gaze 测量时，Kalman Filter 会先根据上一帧速度预测当前注视点，再用当前测量值校正。测量噪声由 `GAZE_KALMAN_MEASUREMENT_NOISE` 和 gaze 置信度共同决定，置信度较低的单眼结果或分歧较大的双眼结果对滤波状态影响更小。
+
+如果当前帧没有可靠 gaze，但滤波器已有稳定历史，系统会在少量帧内继续输出预测 gaze，并按帧数衰减 `confidence`。这让注意力状态在短暂遮挡、眨眼边缘或瞳孔检测空洞时更连续。预测点始终被限制在 `[0, 1]` 范围内。
+
+默认参数：
+
+- `GAZE_KALMAN_ENABLED=1`
+- `GAZE_KALMAN_PROCESS_NOISE=8`
+- `GAZE_KALMAN_MEASUREMENT_NOISE=0.0004`
+- `GAZE_PREDICTION_HOLD_FRAMES=4`
+
 #### One Euro 滤波
 
-注视点输出经过 One Euro Filter 平滑，默认参数：
+Kalman Filter 之后，注视点还会经过 One Euro Filter 做最终平滑。Kalman Filter 主要负责运动模型预测和低置信测量融合，One Euro Filter 主要负责输出去抖和响应速度自适应。
+
+默认参数：
 
 - `ONE_EURO_MIN_CUTOFF=3.0`
 - `ONE_EURO_BETA=0.6`
@@ -328,14 +373,14 @@ right_y = (right_pupil_y - right_eye_center_y) / face_height
 - `face`：人脸框、置信度、跟踪模式和检测器是否运行。
 - `left_eye_box` / `right_eye_box`：左右眼 ROI。
 - `left_eye_center` / `right_eye_center`：左右眼中心。
-- `left_pupil` / `right_pupil`：瞳孔位置、速度、置信度、是否使用模型。
+- `left_pupil` / `right_pupil`：滤波后的瞳孔位置、速度、置信度、是否使用模型。
 - `blink`：眨眼计数、闭眼状态、事件和持续时间。
 
 ### AttentionState
 
 `AttentionState` 是注意力任务输出：
 
-- `gaze`：归一化注视坐标。
+- `gaze`：滤波和预测后的归一化注视坐标。
 - `confidence`：注视置信度。
 - `direction`：九方向分类结果。
 - `calibration`：当前校准状态。
@@ -383,6 +428,13 @@ export PUPIL_GAP_MODEL=/app_demo/app_assets/models/pupil_gap.m1model
 export SCRFD_TRACKING_HZ=30
 export SCRFD_DEGRADED_HZ=60
 export PUPIL_CONFIDENCE_MIN=0.45
+export PUPIL_KALMAN_ENABLED=1
+export PUPIL_KALMAN_PROCESS_NOISE=1800
+export PUPIL_PREDICTION_HOLD_FRAMES=3
+export GAZE_KALMAN_ENABLED=1
+export GAZE_KALMAN_PROCESS_NOISE=8
+export GAZE_KALMAN_MEASUREMENT_NOISE=0.0004
+export GAZE_PREDICTION_HOLD_FRAMES=4
 export ONE_EURO_MIN_CUTOFF=3.0
 export ONE_EURO_BETA=0.6
 export ONE_EURO_D_CUTOFF=1.0
@@ -396,6 +448,13 @@ sh ./scripts/run.sh
 - `SCRFD_TRACKING_HZ`：稳定跟踪状态下 SCRFD 刷新频率。
 - `SCRFD_DEGRADED_HZ`：降级状态下 SCRFD 刷新频率。
 - `PUPIL_CONFIDENCE_MIN`：瞳孔质量阈值，影响跟踪状态和校准采样。
+- `PUPIL_KALMAN_ENABLED`：是否启用瞳孔 Kalman 滤波和短时预测，`1` 启用，`0` 关闭。
+- `PUPIL_KALMAN_PROCESS_NOISE`：瞳孔运动模型过程噪声。数值越大，滤波器越容易跟随快速运动；数值越小，输出越平滑。
+- `PUPIL_PREDICTION_HOLD_FRAMES`：瞳孔丢测量后继续预测的最大帧数。
+- `GAZE_KALMAN_ENABLED`：是否启用 gaze Kalman 预测，`1` 启用，`0` 关闭。
+- `GAZE_KALMAN_PROCESS_NOISE`：gaze 运动模型过程噪声。数值越大，响应越快；数值越小，注视点更稳。
+- `GAZE_KALMAN_MEASUREMENT_NOISE`：gaze 基础测量噪声。数值越大，越信任预测；数值越小，越信任当前测量。
+- `GAZE_PREDICTION_HOLD_FRAMES`：gaze 丢测量后继续输出预测值的最大帧数。
 - `ONE_EURO_MIN_CUTOFF`：One Euro 滤波基础截止频率。
 - `ONE_EURO_BETA`：速度自适应强度。
 - `ONE_EURO_D_CUTOFF`：导数滤波截止频率。
@@ -477,5 +536,6 @@ Commands: q=quit c=calibrate n=status r=clear marks x=reset
 2. **最新帧优先**：算法队列容量为 1，旧帧会被替换，避免延迟持续累积。
 3. **多速率检测**：SCRFD 调用频率随跟踪状态变化，稳定时降低检测频率，降级或重捕时提高检测频率。
 4. **混合瞳孔检测**：传统算法负责常规帧，模型用于低置信恢复或模型优先模式。
-5. **校准与滤波内聚**：注视点映射、九点校准和 One Euro 滤波集中在 `AttentionTask`。
-6. **可观测性较好**：运行日志同时输出采集、入队、算法、延迟、模型调用和跟踪状态。
+5. **预测和平滑分层**：瞳孔层使用 Kalman Filter 稳定像素坐标，注意力层使用 Kalman Filter 预测 gaze，再用 One Euro Filter 做输出去抖。
+6. **校准与滤波内聚**：注视点映射、九点校准、gaze 预测和输出滤波集中在 `AttentionTask`。
+7. **可观测性较好**：运行日志同时输出采集、入队、算法、延迟、模型调用和跟踪状态。
