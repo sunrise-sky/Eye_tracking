@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stdio.h>
+#include <cstdint>
 #include <vector>
 #include <array>
 #include <string>
@@ -59,17 +60,22 @@ class IMAGEPROCESSOR {
       *
       * \param[in] in_img_shape 输入图像尺寸(w, h)。
       * \param[in] in_scale online输入图像和online输出图像之间的尺度倍数（保留参数以兼容接口，但不使用）。
-      * \return none
+     * \return 初始化是否成功。
       */
     // void Initialize(std::array<int, 2>* in_img_shape, BinningRatioType in_scale);
-    void Initialize(std::array<int, 2>* in_img_shape);
+    bool Initialize(std::array<int, 2>* in_img_shape);
     /**
      * 获取offline或者online的图像。
      * 
      * \param[in] img_sensor // 输出图像, 3-D array with layout HWC, SSNE_Y_8 format。
     */
-    void GetImage(ssne_tensor_t* img_sensor);
-    void GetDualImage(ssne_tensor_t* img_out0, ssne_tensor_t* img_out1);
+    bool GetImage(ssne_tensor_t* img_sensor);
+    bool GetDualImage(ssne_tensor_t* img_out0, ssne_tensor_t* img_out1);
+
+    // 关闭并按上次图像配置重开在线管线。
+    bool Restart();
+    bool IsReady() const { return initialized_; }
+    int LastError() const { return last_error_code_; }
     
     /*
      * 对检测坐标进行后处理，还原缩放和padding导致的坐标变化。
@@ -84,11 +90,14 @@ class IMAGEPROCESSOR {
   
   private:
     // online setting
-    uint8_t format_online;
+    uint8_t format_online = SSNE_Y_8;
+    bool initialized_ = false;
+    int last_error_code_ = 0;
 };
 
 class SCRFDGRAY {
   public:
+    ~SCRFDGRAY() { Release(); }
     std::string ModelName() const { return "scrfd_gray"; }
 
     /** \brief 输入单张图像，预测人脸检测框的位置。
@@ -96,9 +105,10 @@ class SCRFDGRAY {
      * \param[in] img_in // 输入图像, 3-D array with layout HWC, BGR format。
      * \param[in] result 模型输出结果, 结构体类型。
      * \param[in] conf_threshold 后处理的置信度阈值，默认是0.25。
-     * \return none
-     */
-    void Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, float conf_threshold = 0.25f);
+     * \return 本次检测流程是否成功完成。
+      */
+    bool Predict(ssne_tensor_t* img_in, FaceDetectionResult* result,
+                 float conf_threshold = 0.25f);
 
     /** \brief 人脸检测模型初始化。
       *
@@ -107,9 +117,9 @@ class SCRFDGRAY {
       * \param[in] in_det_shape 检测图像尺寸(w, h)。
       * \param[in] in_use_kps 模型是否能否输出人脸关键点。
       * \param[in] in_box_len 模型输出bbox的个数，提前为tensorrt预留，内存初始化所用。
-      * \return none
+     * \return 是否初始化成功。
       */
-    void Initialize(std::string& model_path, std::array<int, 2>* in_img_shape, 
+    bool Initialize(std::string& model_path, std::array<int, 2>* in_img_shape,
                     std::array<int, 2>* in_det_shape, bool in_use_kps,
                     int in_box_len);
   
@@ -146,6 +156,7 @@ class SCRFDGRAY {
     std::vector<float> ratios;
     // 释放资源
     void Release();
+    uint64_t FailureCount() const { return failure_count_; }
 
     //debug
     void saveImageBin(const void* data, int w, int h, const char* filename);
@@ -159,6 +170,11 @@ class SCRFDGRAY {
     ssne_tensor_t outputs[6];
     // offline setting
     AiPreprocessPipe pipe_offline = GetAIPreprocessPipe();
+    bool input_ready_ = false;
+    bool outputs_ready_ = false;
+    bool preprocess_ready_ = true;
+    bool initialized_ = false;
+    uint64_t failure_count_ = 0;
 
     // 模型的锚点框
     std::vector<std::array<float, 4>> anchors;

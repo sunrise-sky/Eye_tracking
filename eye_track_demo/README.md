@@ -394,6 +394,9 @@ Kalman Filter 之后，注视点还会经过 One Euro Filter 做最终平滑。K
 - `left_eye_center` / `right_eye_center`：左右眼中心。
 - `left_pupil` / `right_pupil`：滤波后的瞳孔位置、速度、置信度、是否使用模型。
 - `blink`：眨眼计数、闭眼状态、事件和持续时间。
+- `frame_data_error`：当前算法帧为空、尺寸不足或复制失败。
+- `face.detector_error`：SCRFD 本次预处理、推理或取输出失败；与“未检测到人脸”区分。
+- `left_pupil.model_error` / `right_pupil.model_error`：瞳孔模型本次失败，结果已回退到传统算法。
 
 ### AttentionState
 
@@ -457,6 +460,7 @@ export GAZE_PREDICTION_HOLD_FRAMES=4
 export ONE_EURO_MIN_CUTOFF=3.0
 export ONE_EURO_BETA=0.6
 export ONE_EURO_D_CUTOFF=1.0
+export EYE_TRACK_SAVE_LAST_FRAME=0
 sh ./scripts/run.sh
 ```
 
@@ -477,6 +481,7 @@ sh ./scripts/run.sh
 - `ONE_EURO_MIN_CUTOFF`：One Euro 滤波基础截止频率。
 - `ONE_EURO_BETA`：速度自适应强度。
 - `ONE_EURO_D_CUTOFF`：导数滤波截止频率。
+- `EYE_TRACK_SAVE_LAST_FRAME`：设为 `1` 时，退出阶段保存 SCRFD 最后一帧调试数据；默认不写文件，避免存储异常影响正常退出。
 
 模式和模型路径对应的代码修改位置：
 
@@ -513,6 +518,14 @@ app_assets/models/pupil_gap.m1model
        latency_ms_avg=... latency_ms_max=... mode=...
 ```
 
+同时输出累计健康计数 `[HEALTH]`：
+
+```text
+[HEALTH] capture_fail=... restart=成功/尝试 restart_fail=...
+         copy_fail=... queue_busy=... stale=... frame_data=...
+         scrfd_fail=... pupil_model_fail=... process_fail=...
+```
+
 字段含义：
 
 - `capture_fps`：主线程采集帧率。
@@ -526,6 +539,19 @@ app_assets/models/pupil_gap.m1model
 - `latency_ms_avg`：最近一秒算法端到端平均延迟。
 - `latency_ms_max`：最近一秒算法端到端最大延迟。
 - `mode`：当前人脸跟踪状态，可能为 `REACQUIRE`、`DEGRADED` 或 `TRACKING`。
+
+健康字段用于现场验收和故障复盘：`capture_fail` 是取帧失败总数，`restart` 是相机管线重启成功数/尝试数，`copy_fail` 是帧池复制失败数，`queue_busy` 和 `stale` 分别表示队列竞争丢帧和旧帧替换，后三项分别是帧数据、SCRFD、瞳孔模型与算法线程异常计数。
+
+## 异常处理与自动恢复
+
+- 初始化阶段逐项校验 SSNE、模型文件、图像管线和 tensor 容量；任一步失败都会返回失败并按已完成的初始化范围释放资源。
+- 双路取帧失败时不再使用无效 tensor。连续失败 3 次后关闭并重开图像管线，重启后清空跟踪历史；失败循环采用 2–200 ms 退避，避免空转占满 CPU。
+- SCRFD 的预处理、推理和输出获取任一步失败都会立即短路，不再读取无效输出；失败后按 10–500 ms 指数退避重试，并保留上一跟踪预测，而不是误判为“无人脸”。
+- 可选瞳孔模型单次失败会回退到传统检测；连续失败 3 次后禁用模型，传统算法继续提供结果。
+- 算法线程捕获标准异常和未知异常，记录 `process_fail` 并确保帧池 slot 被归还，避免单帧故障造成线程退出或帧池耗尽。
+- `Release()` 和 `Shutdown()` 按资源就绪标记执行，可安全处理初始化中途失败和重复清理。
+
+板上异常测试至少应覆盖：拔插/遮挡或驱动取帧失败、模型路径错误、SCRFD 推理返回错误、瞳孔模型输出非法、帧复制失败，以及正常运行 60 秒后的有序退出。恢复成功后应确认 `[HEALTH]` 计数符合注入次数、算法线程仍有 `epp_fps` 输出、队列深度不持续为 1。
 
 ## 交互命令
 
@@ -564,4 +590,4 @@ Commands: q=quit c=calibrate n=status r=clear marks x=reset
 4. **混合瞳孔检测**：传统算法负责常规帧，模型用于低置信恢复或模型优先模式。
 5. **预测和平滑分层**：瞳孔层使用 Kalman Filter 稳定像素坐标，注意力层使用 Kalman Filter 预测 gaze，再用 One Euro Filter 做输出去抖。
 6. **校准与滤波内聚**：注视点映射、九点校准、gaze 预测和输出滤波集中在 `AttentionTask`。
-7. **可观测性较好**：运行日志同时输出采集、入队、算法、延迟、模型调用和跟踪状态。
+7. **异常可恢复且可观测**：运行日志同时输出采集、入队、算法、延迟、模型调用、管线重启和分层错误计数。

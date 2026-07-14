@@ -8,6 +8,9 @@
  */
 #include <assert.h>
 #include "../include/utils.hpp"
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <cstdio>
 #include <numeric>
@@ -346,9 +349,24 @@ void SCRFDGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
  * @param in_box_len 检测框长度
  * @description 初始化检测器的各种参数，加载模型，生成anchor boxes
  */
-void SCRFDGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_shape, 
+bool SCRFDGRAY::Initialize(std::string& model_path,
+                           std::array<int, 2>* in_img_shape,
                            std::array<int, 2>* in_det_shape, bool in_use_kps,
                            int in_box_len) {
+    if (initialized_) return true;
+    if (!in_img_shape || !in_det_shape || model_path.empty() || in_box_len <= 0 ||
+        (*in_img_shape)[0] <= 0 || (*in_img_shape)[1] <= 0 ||
+        (*in_det_shape)[0] <= 0 || (*in_det_shape)[1] <= 0) {
+        fprintf(stderr, "[SCRFD] invalid initialization parameters\n");
+        failure_count_++;
+        return false;
+    }
+    std::ifstream model_file(model_path.c_str(), std::ios::binary);
+    if (!model_file.good()) {
+        fprintf(stderr, "[SCRFD] model not found: %s\n", model_path.c_str());
+        failure_count_++;
+        return false;
+    }
                             
     // 设置NMS和top-k参数
     nms_threshold = 0.2;   // NMS的IoU阈值
@@ -376,11 +394,27 @@ void SCRFDGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_s
     // 加载模型
     char* model_path_char = const_cast<char*>(model_path.c_str());
     model_id = ssne_loadmodel(model_path_char, SSNE_STATIC_ALLOC);
+    if (ssne_get_model_input_num(model_id) != 1) {
+        fprintf(stderr, "[SCRFD] invalid model input count\n");
+        failure_count_++;
+        Release();
+        return false;
+    }
 
     // 创建模型输入tensor
     uint32_t det_width = static_cast<uint32_t>(det_shape[0]);
     uint32_t det_height = static_cast<uint32_t>(det_shape[1]);
     inputs[0] = create_tensor(det_width, det_height, SSNE_Y_8, SSNE_BUF_AI);
+    if (get_mem_size(inputs[0]) < det_width * det_height) {
+        fprintf(stderr, "[SCRFD] input tensor allocation failed\n");
+        failure_count_++;
+        Release();
+        return false;
+    }
+    input_ready_ = true;
+    initialized_ = true;
+    printf("[SCRFD] model ready: %s\n", model_path.c_str());
+    return true;
 }
 
 
@@ -399,7 +433,14 @@ static bool g_has_frame = false;
  * @param conf_threshold 置信度阈值
  * @description 完整的检测流程：预处理、推理、后处理
  */
-void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float conf_threshold) {
+bool SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result,
+                        float conf_threshold) {
+    if (result) result->Clear();
+    if (!initialized_ || !img || !result) {
+        fprintf(stderr, "[SCRFD] predict called with invalid state or input\n");
+        failure_count_++;
+        return false;
+    }
     // auto start = std::chrono::high_resolution_clock::now();
     // printf("Det --- start offline pipe!\n");
 
@@ -407,9 +448,9 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
     int ret = RunAiPreprocessPipe(pipe_offline, *img, inputs[0]);
     // printf("ret: %d\n", ret);
     if (ret != 0) {
-        printf("[ERROR] Failed to run AI preprocess pipe!\n");
-        printf("ret: %d\n", ret);
-        return;
+        fprintf(stderr, "[SCRFD] preprocess failed, ret=%d\n", ret);
+        failure_count_++;
+        return false;
     }
 
     // 保存当前帧的图像（每次调用都更新，最终保留最后一帧）
@@ -419,13 +460,40 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
     
     
     // 前向推理：在NPU上执行模型推理
-    if (ssne_inference(model_id, 1, inputs))
-    {
-        fprintf(stderr, "ssne inference fail!\n");
+    const int inference_code = ssne_inference(model_id, 1, inputs);
+    if (inference_code != SSNE_ERRCODE_NO_ERROR) {
+        fprintf(stderr, "[SCRFD] inference failed, ret=%d\n", inference_code);
+        failure_count_++;
+        return false;
     }
 
     // 获取模型输出：6个输出tensor（3个分数输出 + 3个检测框输出）
-    ssne_getoutput(model_id, 6, outputs);
+    const int output_code = ssne_getoutput(model_id, 6, outputs);
+    if (output_code != SSNE_ERRCODE_NO_ERROR) {
+        fprintf(stderr, "[SCRFD] get output failed, ret=%d\n", output_code);
+        failure_count_++;
+        return false;
+    }
+    outputs_ready_ = true;
+
+    const int num_bbox = det_shape[0] * det_shape[1] / 1024;
+    const int candidate_counts[3] = {
+        num_bbox * 32, num_bbox * 8, num_bbox * 2
+    };
+    for (int i = 0; i < 3; ++i) {
+        const size_t score_bytes = static_cast<size_t>(candidate_counts[i]) *
+                                   sizeof(float);
+        const size_t box_bytes = score_bytes * 4;
+        if (get_data_type(outputs[i]) != SSNE_FLOAT32 ||
+            get_data_type(outputs[i + 3]) != SSNE_FLOAT32 ||
+            get_mem_size(outputs[i]) < score_bytes ||
+            get_mem_size(outputs[i + 3]) < box_bytes) {
+            fprintf(stderr,
+                    "[SCRFD] output tensor type or size invalid, level=%d\n", i);
+            failure_count_++;
+            return false;
+        }
+    }
     
     // 获取三个不同尺度层的输出数据
     float *out_scores0 = (float*)get_data(outputs[0]);  // 第一层分数输出
@@ -434,8 +502,13 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
     float *out_bboxes0 = (float*)get_data(outputs[3]);  // 第一层检测框输出
     float *out_bboxes1 = (float*)get_data(outputs[4]);  // 第二层检测框输出
     float *out_bboxes2 = (float*)get_data(outputs[5]);  // 第三层检测框输出
+    if (!out_scores0 || !out_scores1 || !out_scores2 ||
+        !out_bboxes0 || !out_bboxes1 || !out_bboxes2) {
+        fprintf(stderr, "[SCRFD] output tensor data is null\n");
+        failure_count_++;
+        return false;
+    }
     
-    result->Clear();
     result->Reserve(std::min(box_len,top_k*4));
     result->landmarks_per_face=0;
     size_t anchor_offset=0;
@@ -449,9 +522,13 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
             const size_t anchor_index=anchor_offset+static_cast<size_t>(i);
             if(anchor_index>=anchors.size()) break;
             const float score=score_data[i];
+            if (!std::isfinite(score)) continue;
             if(score<=conf_threshold) continue;
             const std::array<float,4>& anchor=anchors[anchor_index];
             const float* raw_box=bbox_data+i*4;
+            if (!std::isfinite(raw_box[0]) || !std::isfinite(raw_box[1]) ||
+                !std::isfinite(raw_box[2]) || !std::isfinite(raw_box[3]))
+                continue;
             const std::array<float,4> decoded={
                 fmax(0.f,anchor[0]-raw_box[0]),
                 fmax(0.f,anchor[1]-raw_box[1]),
@@ -464,7 +541,6 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
         anchor_offset+=candidate_count;
     };
 
-    const int num_bbox=det_shape[0]*det_shape[1]/1024;
     collect_candidates(out_scores0,out_bboxes0,num_bbox*32);
     collect_candidates(out_scores1,out_bboxes1,num_bbox*8);
     collect_candidates(out_scores2,out_bboxes2,num_bbox*2);
@@ -477,6 +553,7 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
         result->boxes[i][2]*=w_scale;
         result->boxes[i][3]*=h_scale;
     }
+    return true;
 }
 
 /**
@@ -484,9 +561,10 @@ void SCRFDGRAY::Predict(ssne_tensor_t* img, FaceDetectionResult* result, float c
  * @description 释放所有tensor、预处理管道和计时器资源
  */
 void SCRFDGRAY::Release()
-{   
+{
     // 保存最后一帧的图像（如果有的话）
-    if (g_has_frame) {
+    const char* save_debug = std::getenv("EYE_TRACK_SAVE_LAST_FRAME");
+    if (g_has_frame && save_debug && save_debug[0] == '1') {
         printf("[INFO] Saving last frame images...\n");
         save_tensor(g_last_img, "dbg_in.raw");
         save_tensor(g_last_pipe_input, "dbg_in_pipe.raw");
@@ -494,15 +572,21 @@ void SCRFDGRAY::Release()
     }
 
     // 释放输入和输出tensor
-    release_tensor(inputs[0]);
-    release_tensor(outputs[0]);
-    release_tensor(outputs[1]);
-    release_tensor(outputs[2]);
-    release_tensor(outputs[3]);
-    release_tensor(outputs[4]);
-    release_tensor(outputs[5]);
+    if (input_ready_) {
+        release_tensor(inputs[0]);
+        input_ready_ = false;
+    }
+    if (outputs_ready_) {
+        for (int i = 0; i < 6; ++i) release_tensor(outputs[i]);
+        outputs_ready_ = false;
+    }
     // 释放预处理管道
-    ReleaseAIPreprocessPipe(pipe_offline);
+    if (preprocess_ready_) {
+        ReleaseAIPreprocessPipe(pipe_offline);
+        preprocess_ready_ = false;
+    }
+    initialized_ = false;
+    g_has_frame = false;
 }
 
 /* debug */

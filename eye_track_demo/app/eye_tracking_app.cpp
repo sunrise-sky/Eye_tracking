@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cerrno>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <mutex>
 #include <queue>
@@ -14,19 +16,34 @@
 #include <thread>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/select.h>
+#include <unistd.h>
+#endif
+
 #include "../include/utils.hpp"
 #include "../task/eye_tracking.hpp"
 
 namespace eye_track {
 namespace {
 
+bool TensorHasCapacity(const ssne_tensor_t& tensor, size_t required_bytes) {
+    return get_mem_size(tensor) >= required_bytes;
+}
+
 float ReadEnvFloat(const char* name, float default_value,
                    float minimum, float maximum) {
     const char* raw = std::getenv(name);
     if (!raw || !raw[0]) return default_value;
     char* end = nullptr;
+    errno = 0;
     const float parsed = std::strtof(raw, &end);
-    if (end == raw || !std::isfinite(parsed)) return default_value;
+    if (end == raw || *end != '\0' || errno == ERANGE ||
+        !std::isfinite(parsed)) {
+        fprintf(stderr, "[CONFIG] invalid %s=%s, use %.4g\n",
+                name, raw, default_value);
+        return default_value;
+    }
     return std::max(minimum, std::min(maximum, parsed));
 }
 
@@ -142,7 +159,12 @@ public:
         visualizer_ready_ = true;
 
         std::array<int, 2> image_shape{{kImageWidth, kImageHeight}};
-        processor_.Initialize(&image_shape);
+        if (!processor_.Initialize(&image_shape)) {
+            fprintf(stderr, "[APP] camera pipeline initialization failed, ret=%d\n",
+                    processor_.LastError());
+            Shutdown();
+            return false;
+        }
         processor_ready_ = true;
 
         if (!task_.Initialize(config_)) {
@@ -157,18 +179,53 @@ public:
         for (int i = 0; i < kFramePoolSize; ++i) {
             frame_pool_[i] = create_tensor(kImageWidth, kImageHeight,
                                            SSNE_Y_8, SSNE_BUF_AI);
+            if (!TensorHasCapacity(frame_pool_[i],
+                                   static_cast<size_t>(kImageWidth) * kImageHeight)) {
+                fprintf(stderr, "[APP] frame pool allocation failed, index=%d\n", i);
+                Shutdown();
+                return false;
+            }
+            frame_pool_allocated_++;
         }
         frame_pool_ready_ = true;
         free_frame_mask_.store((1u << kFramePoolSize) - 1u);
 
         output_sensor_[0] = create_tensor(kImageWidth, kImageHeight * 2,
                                           SSNE_Y_8, SSNE_BUF_AI);
+        if (!TensorHasCapacity(output_sensor_[0],
+                               static_cast<size_t>(kImageWidth) * kImageHeight * 2)) {
+            fprintf(stderr, "[APP] display output allocation failed, index=0\n");
+            Shutdown();
+            return false;
+        }
+        display_tensor_mask_ |= 1u << 0;
         output_sensor_[1] = create_tensor(kImageWidth, kImageHeight * 2,
                                           SSNE_Y_8, SSNE_BUF_AI);
+        if (!TensorHasCapacity(output_sensor_[1],
+                               static_cast<size_t>(kImageWidth) * kImageHeight * 2)) {
+            fprintf(stderr, "[APP] display output allocation failed, index=1\n");
+            Shutdown();
+            return false;
+        }
+        display_tensor_mask_ |= 1u << 1;
         mirror_display_[0] = create_tensor(kImageWidth, kImageHeight,
                                            SSNE_Y_8, SSNE_BUF_AI);
+        if (!TensorHasCapacity(mirror_display_[0],
+                               static_cast<size_t>(kImageWidth) * kImageHeight)) {
+            fprintf(stderr, "[APP] mirror tensor allocation failed, index=0\n");
+            Shutdown();
+            return false;
+        }
+        display_tensor_mask_ |= 1u << 2;
         mirror_display_[1] = create_tensor(kImageWidth, kImageHeight,
                                            SSNE_Y_8, SSNE_BUF_AI);
+        if (!TensorHasCapacity(mirror_display_[1],
+                               static_cast<size_t>(kImageWidth) * kImageHeight)) {
+            fprintf(stderr, "[APP] mirror tensor allocation failed, index=1\n");
+            Shutdown();
+            return false;
+        }
+        display_tensor_mask_ |= 1u << 3;
         display_tensors_ready_ = true;
         initialized_ = true;
         return true;
@@ -177,7 +234,19 @@ public:
     int Run() {
         if (!initialized_) return -1;
         ssne_tensor_t image_sensor[2];
-        processor_.GetDualImage(&image_sensor[0], &image_sensor[1]);
+        bool initial_frame_ready = false;
+        for (int attempt = 0; attempt < kInitialCaptureAttempts; ++attempt) {
+            if (CaptureWithRecovery(&image_sensor[0], &image_sensor[1])) {
+                initial_frame_ready = true;
+                break;
+            }
+        }
+        if (!initial_frame_ready) {
+            fprintf(stderr,
+                    "[CAMERA] unable to acquire initial frame after %d attempts\n",
+                    kInitialCaptureAttempts);
+            return -2;
+        }
         copy_double_tensor_buffer(image_sensor[0], image_sensor[1], output_sensor_[0]);
         copy_double_tensor_buffer(image_sensor[0], image_sensor[1], output_sensor_[1]);
         set_isp_debug_config(output_sensor_[0], output_sensor_[1]);
@@ -186,13 +255,26 @@ public:
 
         stopping_.store(false);
         exit_requested_.store(false);
-        inference_thread_ = std::thread(&Impl::InferenceLoop, this);
-        input_thread_ = std::thread(&Impl::InputLoop, this);
+        try {
+            inference_thread_ = std::thread(&Impl::InferenceLoop, this);
+            input_thread_ = std::thread(&Impl::InputLoop, this);
+        } catch (const std::exception& error) {
+            fprintf(stderr, "[APP] worker thread startup failed: %s\n",
+                    error.what());
+            stopping_.store(true);
+            exit_requested_.store(true);
+            queue_cv_.notify_all();
+            if (inference_thread_.joinable()) inference_thread_.join();
+            return -3;
+        }
 
         uint8_t load_flag = 0;
         uint64_t frame_id = 0;
         while (!exit_requested_.load()) {
-            processor_.GetDualImage(&image_sensor[0], &image_sensor[1]);
+            if (!CaptureWithRecovery(&image_sensor[0], &image_sensor[1])) {
+                LogPerformance();
+                continue;
+            }
             const TimePoint captured_at = Clock::now();
             captured_.fetch_add(1);
             get_even_or_odd_flag(load_flag);
@@ -233,18 +315,16 @@ public:
             task_.Release();
             task_ready_ = false;
         }
-        if (display_tensors_ready_) {
-            release_tensor(mirror_display_[0]);
-            release_tensor(mirror_display_[1]);
-            release_tensor(output_sensor_[0]);
-            release_tensor(output_sensor_[1]);
-            display_tensors_ready_ = false;
-        }
-        if (frame_pool_ready_) {
-            for (int i = 0; i < kFramePoolSize; ++i)
-                release_tensor(frame_pool_[i]);
-            frame_pool_ready_ = false;
-        }
+        if (display_tensor_mask_ & (1u << 2)) release_tensor(mirror_display_[0]);
+        if (display_tensor_mask_ & (1u << 3)) release_tensor(mirror_display_[1]);
+        if (display_tensor_mask_ & (1u << 0)) release_tensor(output_sensor_[0]);
+        if (display_tensor_mask_ & (1u << 1)) release_tensor(output_sensor_[1]);
+        display_tensor_mask_ = 0;
+        display_tensors_ready_ = false;
+        for (int i = 0; i < frame_pool_allocated_; ++i)
+            release_tensor(frame_pool_[i]);
+        frame_pool_allocated_ = 0;
+        frame_pool_ready_ = false;
         if (processor_ready_) {
             processor_.Release();
             processor_ready_ = false;
@@ -265,12 +345,48 @@ private:
     static const int kImageHeight = 480;
     static const int kFramePoolSize = 2;
     static const int kMaxBlinkMarks = 20;
+    static const int kInitialCaptureAttempts = 10;
+    static const int kCaptureFailureRestartThreshold = 3;
 
     struct InferenceFrame {
         int pool_index = -1;
         uint64_t frame_id = 0;
         TimePoint captured_at;
     };
+
+    bool CaptureWithRecovery(ssne_tensor_t* left, ssne_tensor_t* right) {
+        if (processor_.GetDualImage(left, right)) {
+            consecutive_capture_failures_ = 0;
+            return true;
+        }
+
+        capture_failures_.fetch_add(1);
+        consecutive_capture_failures_++;
+        const int error_code = processor_.LastError();
+        fprintf(stderr, "[CAMERA] capture failed, ret=%d streak=%d\n",
+                error_code, consecutive_capture_failures_);
+
+        if (consecutive_capture_failures_ >=
+            kCaptureFailureRestartThreshold) {
+            pipeline_restart_attempts_.fetch_add(1);
+            if (processor_.Restart()) {
+                pipeline_restart_successes_.fetch_add(1);
+                consecutive_capture_failures_ = 0;
+                reset_requested_.store(true);
+                fprintf(stderr, "[CAMERA] pipeline restart succeeded\n");
+            } else {
+                pipeline_restart_failures_.fetch_add(1);
+                fprintf(stderr, "[CAMERA] pipeline restart failed, ret=%d\n",
+                        processor_.LastError());
+            }
+        }
+
+        const int shift = std::min(6, std::max(0,
+            consecutive_capture_failures_ - 1));
+        const int backoff_ms = std::min(200, 2 * (1 << shift));
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        return false;
+    }
 
     int AcquireFrameSlot() {
         unsigned int mask = free_frame_mask_.load(std::memory_order_relaxed);
@@ -296,20 +412,26 @@ private:
         if (slot < 0) {
             std::unique_lock<std::mutex> recycle_lock(queue_mutex_,
                                                        std::try_to_lock);
-            if (!recycle_lock.owns_lock() || frame_queue_.empty()) return false;
+            if (!recycle_lock.owns_lock() || frame_queue_.empty()) {
+                queue_busy_drops_.fetch_add(1);
+                return false;
+            }
             slot = frame_queue_.front().pool_index;
             frame_queue_.pop();
             queue_depth_.store(0);
             dropped_.fetch_add(1);
+            stale_replacements_.fetch_add(1);
         }
         if (copy_tensor_buffer(source, frame_pool_[slot]) !=
             SSNE_ERRCODE_NO_ERROR) {
+            frame_copy_failures_.fetch_add(1);
             ReturnFrameSlot(slot);
             return false;
         }
 
         std::unique_lock<std::mutex> lock(queue_mutex_, std::try_to_lock);
         if (!lock.owns_lock()) {
+            queue_busy_drops_.fetch_add(1);
             ReturnFrameSlot(slot);
             return false;
         }
@@ -318,6 +440,7 @@ private:
             frame_queue_.pop();
             ReturnFrameSlot(stale.pool_index);
             dropped_.fetch_add(1);
+            stale_replacements_.fetch_add(1);
         }
         InferenceFrame frame;
         frame.pool_index = slot;
@@ -345,43 +468,69 @@ private:
                 queue_depth_.store(0);
             }
 
-            if (calibration_requested_.exchange(false))
-                task_.HandleCommand(TaskCommand::StartCalibration);
-            if (reset_requested_.exchange(false))
-                task_.HandleCommand(TaskCommand::Reset);
-            if (clear_marks_requested_.exchange(false)) {
-                blink_marks_.clear();
-                std::vector<RectF> empty;
-                visualizer_.Draw(empty);
+            bool processed = false;
+            try {
+                if (calibration_requested_.exchange(false))
+                    task_.HandleCommand(TaskCommand::StartCalibration);
+                if (reset_requested_.exchange(false))
+                    task_.HandleCommand(TaskCommand::Reset);
+                if (clear_marks_requested_.exchange(false)) {
+                    blink_marks_.clear();
+                    std::vector<RectF> empty;
+                    visualizer_.Draw(empty);
+                }
+
+                FramePacket packet;
+                packet.image = &frame_pool_[frame.pool_index];
+                packet.frame_id = frame.frame_id;
+                packet.captured_at = frame.captured_at;
+                const EyeTrackingResult result = task_.Process(packet);
+                if (result.tracking.face.detector_ran)
+                    detector_runs_.fetch_add(1);
+                if (result.tracking.left_pupil.used_model)
+                    model_runs_.fetch_add(1);
+                if (result.tracking.right_pupil.used_model)
+                    model_runs_.fetch_add(1);
+                if (result.tracking.frame_data_error)
+                    frame_data_failures_.fetch_add(1);
+                if (result.tracking.face.detector_error)
+                    detector_failures_.fetch_add(1);
+                if (result.tracking.left_pupil.model_error)
+                    model_failures_.fetch_add(1);
+                if (result.tracking.right_pupil.model_error)
+                    model_failures_.fetch_add(1);
+                if (result.attention.gaze_valid) gaze_valid_.fetch_add(1);
+                if (result.tracking.blink.event && result.attention.gaze_valid) {
+                    if (static_cast<int>(blink_marks_.size()) >= kMaxBlinkMarks)
+                        blink_marks_.erase(blink_marks_.begin());
+                    blink_marks_.push_back(result.attention.gaze);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(result_mutex_);
+                    latest_result_ = result;
+                }
+                Render(result);
+                processed = true;
+            } catch (const std::exception& error) {
+                processing_failures_.fetch_add(1);
+                dropped_.fetch_add(1);
+                fprintf(stderr, "[Inference] processing exception: %s\n",
+                        error.what());
+            } catch (...) {
+                processing_failures_.fetch_add(1);
+                dropped_.fetch_add(1);
+                fprintf(stderr, "[Inference] unknown processing exception\n");
             }
 
-            FramePacket packet;
-            packet.image = &frame_pool_[frame.pool_index];
-            packet.frame_id = frame.frame_id;
-            packet.captured_at = frame.captured_at;
-            const EyeTrackingResult result = task_.Process(packet);
-            if (result.tracking.face.detector_ran) detector_runs_.fetch_add(1);
-            if (result.tracking.left_pupil.used_model) model_runs_.fetch_add(1);
-            if (result.tracking.right_pupil.used_model) model_runs_.fetch_add(1);
-            if (result.attention.gaze_valid) gaze_valid_.fetch_add(1);
-            if (result.tracking.blink.event && result.attention.gaze_valid) {
-                if (static_cast<int>(blink_marks_.size()) >= kMaxBlinkMarks)
-                    blink_marks_.erase(blink_marks_.begin());
-                blink_marks_.push_back(result.attention.gaze);
+            if (processed) {
+                const uint64_t latency = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        Clock::now() - frame.captured_at).count());
+                latency_us_.fetch_add(latency);
+                UpdateMaxLatency(latency);
+                inferred_.fetch_add(1);
             }
-
-            {
-                std::lock_guard<std::mutex> lock(result_mutex_);
-                latest_result_ = result;
-            }
-            Render(result);
-
-            const uint64_t latency = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    Clock::now() - frame.captured_at).count());
-            latency_us_.fetch_add(latency);
-            UpdateMaxLatency(latency);
-            inferred_.fetch_add(1);
             ReturnFrameSlot(frame.pool_index);
         }
         printf("[Thread] Inference stopped\n");
@@ -390,7 +539,24 @@ private:
     void InputLoop() {
         std::string input;
         printf("Commands: q=quit c=calibrate n=status r=clear marks x=reset\n");
-        while (std::cin >> input) {
+        while (!exit_requested_.load()) {
+#ifdef __linux__
+            fd_set read_set;
+            FD_ZERO(&read_set);
+            FD_SET(STDIN_FILENO, &read_set);
+            timeval timeout;
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 200000;
+            const int ready = select(STDIN_FILENO + 1, &read_set,
+                                     nullptr, nullptr, &timeout);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "[Input] select failed, errno=%d\n", errno);
+                break;
+            }
+            if (ready == 0) continue;
+#endif
+            if (!(std::cin >> input)) break;
             if (input == "q" || input == "Q") {
                 exit_requested_.store(true);
                 break;
@@ -521,6 +687,20 @@ private:
                static_cast<unsigned long long>(model - last_model_),
                queue_depth_.load(), average_latency, max_latency / 1000.0,
                TrackingModeName(mode));
+        printf("[HEALTH] capture_fail=%llu restart=%llu/%llu restart_fail=%llu "
+               "copy_fail=%llu queue_busy=%llu stale=%llu frame_data=%llu "
+               "scrfd_fail=%llu pupil_model_fail=%llu process_fail=%llu\n",
+               static_cast<unsigned long long>(capture_failures_.load()),
+               static_cast<unsigned long long>(pipeline_restart_successes_.load()),
+               static_cast<unsigned long long>(pipeline_restart_attempts_.load()),
+               static_cast<unsigned long long>(pipeline_restart_failures_.load()),
+               static_cast<unsigned long long>(frame_copy_failures_.load()),
+               static_cast<unsigned long long>(queue_busy_drops_.load()),
+               static_cast<unsigned long long>(stale_replacements_.load()),
+               static_cast<unsigned long long>(frame_data_failures_.load()),
+               static_cast<unsigned long long>(detector_failures_.load()),
+               static_cast<unsigned long long>(model_failures_.load()),
+               static_cast<unsigned long long>(processing_failures_.load()));
 
         last_captured_ = captured;
         last_enqueued_ = enqueued;
@@ -569,6 +749,17 @@ private:
     std::atomic<uint64_t> detector_runs_{0};
     std::atomic<uint64_t> model_runs_{0};
     std::atomic<uint64_t> gaze_valid_{0};
+    std::atomic<uint64_t> capture_failures_{0};
+    std::atomic<uint64_t> pipeline_restart_attempts_{0};
+    std::atomic<uint64_t> pipeline_restart_successes_{0};
+    std::atomic<uint64_t> pipeline_restart_failures_{0};
+    std::atomic<uint64_t> frame_copy_failures_{0};
+    std::atomic<uint64_t> queue_busy_drops_{0};
+    std::atomic<uint64_t> stale_replacements_{0};
+    std::atomic<uint64_t> frame_data_failures_{0};
+    std::atomic<uint64_t> detector_failures_{0};
+    std::atomic<uint64_t> model_failures_{0};
+    std::atomic<uint64_t> processing_failures_{0};
 
     TimePoint last_log_ = Clock::now();
     uint64_t last_captured_ = 0;
@@ -587,6 +778,9 @@ private:
     bool task_ready_ = false;
     bool frame_pool_ready_ = false;
     bool display_tensors_ready_ = false;
+    int frame_pool_allocated_ = 0;
+    unsigned int display_tensor_mask_ = 0;
+    int consecutive_capture_failures_ = 0;
 };
 
 EyeTrackingApp::EyeTrackingApp(const char* default_pupil_mode)

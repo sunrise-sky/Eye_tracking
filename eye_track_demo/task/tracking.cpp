@@ -24,17 +24,25 @@ struct PupilObservation {
     float blink_dark_ratio = 0.f;
     bool blink_valid = false;
     bool used_model = false;
+    bool model_failed = false;
 };
 
 class PupilDetector {
 public:
     bool Initialize(int width, int height, const std::string& model_path,
                     bool enable_model, bool prefer_model) {
+        if (width <= 0 || height <= 0) return false;
         image_width_ = width;
         image_height_ = height;
         prefer_model_ = prefer_model;
         linux_tensor_ = create_tensor(width, height, SSNE_Y_8, SSNE_BUF_LINUX);
         linux_tensor_ready_ = true;
+        if (get_mem_size(linux_tensor_) <
+            static_cast<size_t>(width) * static_cast<size_t>(height)) {
+            fprintf(stderr, "[PupilDetector] frame buffer allocation failed\n");
+            Release();
+            return false;
+        }
         image_buffer_.resize(static_cast<size_t>(width) * height);
         printf("[PupilDetector] classic mode ready\n");
         if (enable_model) InitializeModel(model_path);
@@ -43,6 +51,7 @@ public:
 
     bool PrepareFrame(ssne_tensor_t* image) {
         if (!image || image_buffer_.empty()) return false;
+        if (get_mem_size(*image) < image_buffer_.size()) return false;
         if (copy_tensor_buffer(*image, linux_tensor_) != SSNE_ERRCODE_NO_ERROR)
             return false;
         return save_tensor_buffer_ptr(linux_tensor_, image_buffer_.data(),
@@ -58,6 +67,7 @@ public:
         const int roi_width = x2 - x1;
         const int roi_height = y2 - y1;
 
+        bool model_failed = false;
         if (prefer_model_ && allow_model_recovery && model_ready_) {
             PupilObservation model = DetectWithModel(
                 x1, y1, roi_width, roi_height, previous);
@@ -67,10 +77,12 @@ public:
                 model.blink_valid = true;
                 return model;
             }
+            model_failed = model.model_failed;
         }
 
         PupilObservation classic = DetectClassic(
             x1, y1, roi_width, roi_height, previous);
+        classic.model_failed = model_failed;
         if (allow_model_recovery && model_ready_ &&
             (!classic.valid || classic.confidence < kModelFallbackConfidence)) {
             PupilObservation model = DetectWithModel(
@@ -80,6 +92,7 @@ public:
                 model.blink_valid = classic.blink_valid;
                 return model;
             }
+            classic.model_failed = classic.model_failed || model.model_failed;
         }
         return classic;
     }
@@ -91,6 +104,8 @@ public:
         return prefer_model_ ? "model primary + classic fallback"
                              : "classic + model recovery";
     }
+
+    uint64_t FailureCount() const { return model_failure_count_; }
 
     void Release() {
         if (output_ready_) {
@@ -107,6 +122,7 @@ public:
         }
         image_buffer_.clear();
         model_ready_ = false;
+        model_failure_streak_ = 0;
     }
 
 private:
@@ -276,6 +292,13 @@ private:
             model_input_u8_.resize(kModelInputSize * kModelInputSize);
         }
         model_input_ready_ = true;
+        const size_t required_bytes = data_type == SSNE_FLOAT32
+            ? static_cast<size_t>(kModelInputSize) * kModelInputSize * sizeof(float)
+            : static_cast<size_t>(kModelInputSize) * kModelInputSize;
+        if (get_mem_size(model_input_) < required_bytes) {
+            DisableModel("[PupilDetector] model input allocation failed, use classic\n");
+            return;
+        }
         model_ready_ = true;
         printf("[PupilDetector] optional model ready: %s dtype=%d\n",
                model_path.c_str(), model_input_type_);
@@ -286,36 +309,43 @@ private:
                                      const PupilObservation* previous) {
         PupilObservation result;
         if (!FillModelInput(eye_x, eye_y, roi_width, roi_height)) {
-            DisableModel("[PupilDetector] model input failed, switch to classic\n");
+            result.model_failed = true;
+            RecordModelFailure("model input copy failed");
             return result;
         }
         if (ssne_inference(model_id_, 1, &model_input_) !=
             SSNE_ERRCODE_NO_ERROR) {
-            DisableModel("[PupilDetector] model inference failed, switch to classic\n");
+            result.model_failed = true;
+            RecordModelFailure("model inference failed");
             return result;
         }
         if (ssne_getoutput(model_id_, 1, outputs_) !=
             SSNE_ERRCODE_NO_ERROR) {
-            DisableModel("[PupilDetector] model output failed, switch to classic\n");
+            result.model_failed = true;
+            RecordModelFailure("model output unavailable");
             return result;
         }
         output_ready_ = true;
         if (get_data_type(outputs_[0]) != SSNE_FLOAT32 ||
             get_mem_size(outputs_[0]) < 2 * sizeof(float)) {
-            DisableModel("[PupilDetector] model output type invalid, switch to classic\n");
+            result.model_failed = true;
+            RecordModelFailure("model output type or size invalid");
             return result;
         }
 
         float* output = static_cast<float*>(get_data(outputs_[0]));
         if (!output || !std::isfinite(output[0]) || !std::isfinite(output[1])) {
-            DisableModel("[PupilDetector] model output data invalid, switch to classic\n");
+            result.model_failed = true;
+            RecordModelFailure("model output contains non-finite data");
             return result;
         }
         if (output[0] < -0.25f || output[0] > 1.25f ||
             output[1] < -0.25f || output[1] > 1.25f) {
-            DisableModel("[PupilDetector] model output range invalid, switch to classic\n");
+            result.model_failed = true;
+            RecordModelFailure("model output outside safety range");
             return result;
         }
+        model_failure_streak_ = 0;
 
         const float nx = Clamp01(output[0]);
         const float ny = Clamp01(output[1]);
@@ -403,6 +433,18 @@ private:
         model_ready_ = false;
     }
 
+    void RecordModelFailure(const char* reason) {
+        model_failure_count_++;
+        model_failure_streak_++;
+        fprintf(stderr, "[PupilDetector] %s, fallback=classic streak=%d/3\n",
+                reason, model_failure_streak_);
+        if (model_failure_streak_ >= 3) {
+            model_ready_ = false;
+            fprintf(stderr,
+                    "[PupilDetector] model disabled after repeated failures\n");
+        }
+    }
+
     bool ClipEyeBox(const RectF& box, int& x1, int& y1, int& x2, int& y2) const {
         x1 = std::max(0, std::min(image_width_,
             static_cast<int>(std::floor(box[0]))));
@@ -430,6 +472,8 @@ private:
     ssne_tensor_t outputs_[1];
     std::vector<uint8_t> model_input_u8_;
     std::vector<float> model_input_f32_;
+    int model_failure_streak_ = 0;
+    uint64_t model_failure_count_ = 0;
 };
 
 constexpr float PupilDetector::kModelFallbackConfidence;
@@ -692,6 +736,7 @@ PupilState PublishPupil(const PupilObservation& observation,
                         const PupilState& previous, int missed_frames,
                         TimePoint now, TimePoint previous_time) {
     PupilState state;
+    state.model_error = observation.model_failed;
     state.position = Point2f{{observation.x, observation.y}};
     state.confidence = observation.confidence;
     state.dark_ratio = observation.blink_dark_ratio;
@@ -728,6 +773,7 @@ PupilState PublishFilteredPupil(const PupilObservation& observation,
     }
 
     PupilState state;
+    state.model_error = observation.model_failed;
     const float min_x = eye_box[0];
     const float min_y = eye_box[1];
     const float max_x = std::max(min_x, eye_box[2] - 1.f);
@@ -782,19 +828,35 @@ public:
         std::array<int, 2> detector_shape{{640, 480}};
         std::string face_model = config.face_model;
         const int box_length = detector_shape[0] * detector_shape[1] / 512 * 21;
-        face_detector_.Initialize(face_model, &image_shape, &detector_shape,
-                                  false, box_length);
+        if (!face_detector_.Initialize(face_model, &image_shape, &detector_shape,
+                                       false, box_length)) {
+            fprintf(stderr, "[TrackingTask] face detector initialization failed\n");
+            return false;
+        }
 
         const bool enable_model = config.pupil_mode != PupilMode::Classic;
         const bool prefer_model = config.pupil_mode == PupilMode::Model;
-        pupil_detector_.Initialize(config.image_width, config.image_height,
-                                   config.pupil_model,
-                                   enable_model, prefer_model);
+        if (!pupil_detector_.Initialize(config.image_width, config.image_height,
+                                        config.pupil_model,
+                                        enable_model, prefer_model)) {
+            fprintf(stderr, "[TrackingTask] pupil detector initialization failed\n");
+            face_detector_.Release();
+            return false;
+        }
         printf("[INFO] Pupil detector OK (%s)\n", pupil_detector_.ModeName());
 
         mirrored_ = create_tensor(config.image_width, config.image_height,
                                   SSNE_Y_8, SSNE_BUF_AI);
         mirrored_ready_ = true;
+        if (get_mem_size(mirrored_) <
+            static_cast<size_t>(config.image_width) * config.image_height) {
+            fprintf(stderr, "[TrackingTask] mirror tensor allocation failed\n");
+            pupil_detector_.Release();
+            face_detector_.Release();
+            release_tensor(mirrored_);
+            mirrored_ready_ = false;
+            return false;
+        }
         face_tracker_.reset(new FaceTracker(config.image_width,
                                             config.image_height, config));
         initialized_ = true;
@@ -806,6 +868,12 @@ public:
         state.frame_id = frame.frame_id;
         state.timestamp = Clock::now();
         if (!initialized_ || !frame.image) return state;
+        if (get_mem_size(*frame.image) <
+            static_cast<size_t>(config_.image_width) * config_.image_height) {
+            state.frame_data_error = true;
+            frame_data_failures_++;
+            return state;
+        }
 
         mirror_tensor(*frame.image, mirrored_);
         const TimePoint now = Clock::now();
@@ -813,16 +881,32 @@ public:
         face_tracker_->Predict(now);
 
         FaceDetectionResult detection;
-        const bool ran_detector = face_tracker_->ShouldRunDetector(now);
+        const bool ran_detector = face_tracker_->ShouldRunDetector(now) &&
+                                  now >= face_detector_retry_after_;
         if (ran_detector) {
-            face_detector_.Predict(&mirrored_, &detection, 0.4f);
             detector_runs_++;
-            if (!detection.boxes.empty()) {
-                face_tracker_->UpdateDetection(detection.boxes[0], now);
-                face_confidence_ = detection.scores.empty() ? 1.f : detection.scores[0];
+            if (!face_detector_.Predict(&mirrored_, &detection, 0.4f)) {
+                state.face.detector_error = true;
+                detector_failures_++;
+                consecutive_detector_failures_++;
+                const int shift = std::min(5, consecutive_detector_failures_ - 1);
+                const int retry_ms = std::min(500, 10 * (1 << shift));
+                face_detector_retry_after_ = now +
+                    std::chrono::milliseconds(retry_ms);
+                fprintf(stderr,
+                        "[TrackingTask] SCRFD failure, retry_in_ms=%d streak=%d\n",
+                        retry_ms, consecutive_detector_failures_);
             } else {
-                face_tracker_->UpdateDetectionMiss(now);
-                face_confidence_ *= 0.7f;
+                consecutive_detector_failures_ = 0;
+                face_detector_retry_after_ = TimePoint();
+                if (!detection.boxes.empty()) {
+                    face_tracker_->UpdateDetection(detection.boxes[0], now);
+                    face_confidence_ = detection.scores.empty()
+                        ? 1.f : detection.scores[0];
+                } else {
+                    face_tracker_->UpdateDetectionMiss(now);
+                    face_confidence_ *= 0.7f;
+                }
             }
         }
 
@@ -863,6 +947,10 @@ public:
         PupilObservation left;
         PupilObservation right;
         const bool frame_ready = pupil_detector_.PrepareFrame(&mirrored_);
+        if (!frame_ready) {
+            state.frame_data_error = true;
+            frame_data_failures_++;
+        }
         const bool allow_model = pupil_detector_.PreferModel() ||
             face_tracker_->Mode() != TrackingMode::Stable;
         if (frame_ready) {
@@ -878,19 +966,21 @@ public:
         if (left.used_model) model_recovery_runs_++;
         if (right.used_model) model_recovery_runs_++;
 
-        if (left.valid) left_history_ = left;
-        else {
-            left_history_.confidence *= 0.70f;
-            if (left_history_.confidence < 0.20f) left_history_.valid = false;
-        }
-        if (right.valid) right_history_ = right;
-        else {
-            right_history_.confidence *= 0.70f;
-            if (right_history_.confidence < 0.20f) right_history_.valid = false;
-        }
+        if (frame_ready) {
+            if (left.valid) left_history_ = left;
+            else {
+                left_history_.confidence *= 0.70f;
+                if (left_history_.confidence < 0.20f) left_history_.valid = false;
+            }
+            if (right.valid) right_history_ = right;
+            else {
+                right_history_.confidence *= 0.70f;
+                if (right_history_.confidence < 0.20f) right_history_.valid = false;
+            }
 
-        face_tracker_->UpdatePupilQuality(left, right);
-        state.face.mode = face_tracker_->Mode();
+            face_tracker_->UpdatePupilQuality(left, right);
+            state.face.mode = face_tracker_->Mode();
+        }
 
         if (!left.valid) left_missed_++; else left_missed_ = 0;
         if (!right.valid) right_missed_++; else right_missed_ = 0;
@@ -932,6 +1022,8 @@ public:
         right_pupil_filter_.Reset();
         face_confidence_ = 0.f;
         blink_detector_.Reset();
+        consecutive_detector_failures_ = 0;
+        face_detector_retry_after_ = TimePoint();
     }
 
     void Release() {
@@ -970,6 +1062,10 @@ private:
     TimePoint previous_pupil_time_ = Clock::now();
     uint64_t detector_runs_ = 0;
     uint64_t model_recovery_runs_ = 0;
+    uint64_t detector_failures_ = 0;
+    uint64_t frame_data_failures_ = 0;
+    int consecutive_detector_failures_ = 0;
+    TimePoint face_detector_retry_after_;
 };
 
 TrackingTask::TrackingTask() : impl_(new Impl()) {}

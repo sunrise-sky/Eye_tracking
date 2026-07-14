@@ -55,6 +55,7 @@ struct FaceState {
     float confidence = 0.f;
     TrackingMode mode = TrackingMode::Reacquire;
     bool detector_ran = false;
+    bool detector_error = false;
     bool valid = false;
 };
 
@@ -66,6 +67,7 @@ struct PupilState {
     int missed_frames = 0;
     bool blink_measurement_valid = false;
     bool used_model = false;
+    bool model_error = false;
     bool valid = false;
 };
 
@@ -79,6 +81,7 @@ struct BlinkState {
 struct TrackingState {
     uint64_t frame_id = 0;
     TimePoint timestamp;
+    bool frame_data_error = false;
     FaceState face;
     RectF left_eye_box{{0.f, 0.f, 0.f, 0.f}};
     RectF right_eye_box{{0.f, 0.f, 0.f, 0.f}};
