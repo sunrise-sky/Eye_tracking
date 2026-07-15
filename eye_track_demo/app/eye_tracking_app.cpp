@@ -485,8 +485,17 @@ private:
                 packet.frame_id = frame.frame_id;
                 packet.captured_at = frame.captured_at;
                 const EyeTrackingResult result = task_.Process(packet);
+                if (result.tracking.face.detector_scheduled)
+                    detector_requests_.fetch_add(1);
                 if (result.tracking.face.detector_ran)
                     detector_runs_.fetch_add(1);
+                if (result.tracking.face.detector_ran) {
+                    const uint64_t detector_latency = static_cast<uint64_t>(
+                        std::max(0.f,
+                            result.tracking.face.detector_latency_ms) * 1000.f);
+                    detector_latency_us_.fetch_add(detector_latency);
+                    UpdateMaxDetectorLatency(detector_latency);
+                }
                 if (result.tracking.left_pupil.used_model)
                     model_runs_.fetch_add(1);
                 if (result.tracking.right_pupil.used_model)
@@ -652,6 +661,13 @@ private:
                !latency_max_us_.compare_exchange_weak(current, latency)) {}
     }
 
+    void UpdateMaxDetectorLatency(uint64_t latency) {
+        uint64_t current = detector_latency_max_us_.load();
+        while (current < latency &&
+               !detector_latency_max_us_.compare_exchange_weak(
+                   current, latency)) {}
+    }
+
     void LogPerformance() {
         const TimePoint now = Clock::now();
         const double elapsed = std::chrono::duration<double>(now - last_log_).count();
@@ -662,6 +678,8 @@ private:
         const uint64_t inferred = inferred_.load();
         const uint64_t latency = latency_us_.load();
         const uint64_t detector = detector_runs_.load();
+        const uint64_t detector_requests = detector_requests_.load();
+        const uint64_t detector_latency = detector_latency_us_.load();
         const uint64_t model = model_runs_.load();
         const uint64_t gaze = gaze_valid_.load();
         const uint64_t inferred_delta = inferred - last_inferred_;
@@ -669,6 +687,14 @@ private:
         const double average_latency = inferred_delta == 0 ? 0.0
             : static_cast<double>(latency_delta) / inferred_delta / 1000.0;
         const uint64_t max_latency = latency_max_us_.exchange(0);
+        const uint64_t detector_delta = detector - last_detector_;
+        const uint64_t detector_latency_delta =
+            detector_latency - last_detector_latency_;
+        const double average_detector_latency = detector_delta == 0 ? 0.0
+            : static_cast<double>(detector_latency_delta) /
+              detector_delta / 1000.0;
+        const uint64_t max_detector_latency =
+            detector_latency_max_us_.exchange(0);
 
         TrackingMode mode = TrackingMode::Reacquire;
         {
@@ -676,14 +702,18 @@ private:
             mode = latest_result_.tracking.face.mode;
         }
         printf("[PERF] capture_fps=%.1f enqueue_fps=%.1f drop=%llu "
-               "epp_fps=%.1f gaze=%llu scrfd=%llu model_recovery=%llu "
+               "epp_fps=%.1f gaze=%llu scrfd_req=%llu scrfd_done=%llu "
+               "scrfd_ms_avg=%.1f scrfd_ms_max=%.1f model_recovery=%llu "
                "queue=%d latency_ms_avg=%.1f latency_ms_max=%.1f mode=%s\n",
                (captured - last_captured_) / elapsed,
                (enqueued - last_enqueued_) / elapsed,
                static_cast<unsigned long long>(dropped - last_dropped_),
                inferred_delta / elapsed,
                static_cast<unsigned long long>(gaze - last_gaze_),
-               static_cast<unsigned long long>(detector - last_detector_),
+               static_cast<unsigned long long>(
+                   detector_requests - last_detector_requests_),
+               static_cast<unsigned long long>(detector_delta),
+               average_detector_latency, max_detector_latency / 1000.0,
                static_cast<unsigned long long>(model - last_model_),
                queue_depth_.load(), average_latency, max_latency / 1000.0,
                TrackingModeName(mode));
@@ -708,6 +738,8 @@ private:
         last_inferred_ = inferred;
         last_latency_ = latency;
         last_detector_ = detector;
+        last_detector_requests_ = detector_requests;
+        last_detector_latency_ = detector_latency;
         last_model_ = model;
         last_gaze_ = gaze;
         last_log_ = now;
@@ -747,6 +779,9 @@ private:
     std::atomic<uint64_t> latency_us_{0};
     std::atomic<uint64_t> latency_max_us_{0};
     std::atomic<uint64_t> detector_runs_{0};
+    std::atomic<uint64_t> detector_requests_{0};
+    std::atomic<uint64_t> detector_latency_us_{0};
+    std::atomic<uint64_t> detector_latency_max_us_{0};
     std::atomic<uint64_t> model_runs_{0};
     std::atomic<uint64_t> gaze_valid_{0};
     std::atomic<uint64_t> capture_failures_{0};
@@ -768,6 +803,8 @@ private:
     uint64_t last_inferred_ = 0;
     uint64_t last_latency_ = 0;
     uint64_t last_detector_ = 0;
+    uint64_t last_detector_requests_ = 0;
+    uint64_t last_detector_latency_ = 0;
     uint64_t last_model_ = 0;
     uint64_t last_gaze_ = 0;
 

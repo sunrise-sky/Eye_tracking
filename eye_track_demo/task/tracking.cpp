@@ -5,8 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace eye_track {
@@ -98,6 +103,8 @@ public:
     }
 
     bool PreferModel() const { return prefer_model_; }
+
+    void SetNpuMutex(std::mutex* mutex) { npu_mutex_ = mutex; }
 
     const char* ModeName() const {
         if (!model_ready_) return "classic";
@@ -308,6 +315,13 @@ private:
                                      int roi_height,
                                      const PupilObservation* previous) {
         PupilObservation result;
+        std::unique_lock<std::mutex> npu_lock;
+        if (npu_mutex_) {
+            std::unique_lock<std::mutex> candidate(*npu_mutex_,
+                                                    std::try_to_lock);
+            if (!candidate.owns_lock()) return result;
+            npu_lock = std::move(candidate);
+        }
         if (!FillModelInput(eye_x, eye_y, roi_width, roi_height)) {
             result.model_failed = true;
             RecordModelFailure("model input copy failed");
@@ -474,6 +488,7 @@ private:
     std::vector<float> model_input_f32_;
     int model_failure_streak_ = 0;
     uint64_t model_failure_count_ = 0;
+    std::mutex* npu_mutex_ = nullptr;
 };
 
 constexpr float PupilDetector::kModelFallbackConfidence;
@@ -821,6 +836,15 @@ PupilState PublishFilteredPupil(const PupilObservation& observation,
 }  // namespace
 
 class TrackingTask::Impl {
+    struct DetectorResponse {
+        FaceDetectionResult detection;
+        uint64_t frame_id = 0;
+        uint64_t generation = 0;
+        TimePoint source_time;
+        float latency_ms = 0.f;
+        bool success = false;
+    };
+
 public:
     bool Initialize(const TrackingConfig& config) {
         config_ = config;
@@ -843,6 +867,7 @@ public:
             face_detector_.Release();
             return false;
         }
+        pupil_detector_.SetNpuMutex(&npu_mutex_);
         printf("[INFO] Pupil detector OK (%s)\n", pupil_detector_.ModeName());
 
         mirrored_ = create_tensor(config.image_width, config.image_height,
@@ -857,9 +882,33 @@ public:
             mirrored_ready_ = false;
             return false;
         }
+        detector_frame_ = create_tensor(config.image_width, config.image_height,
+                                        SSNE_Y_8, SSNE_BUF_AI);
+        detector_frame_ready_ = true;
+        if (get_mem_size(detector_frame_) <
+            static_cast<size_t>(config.image_width) * config.image_height) {
+            fprintf(stderr, "[TrackingTask] detector snapshot allocation failed\n");
+            release_tensor(detector_frame_);
+            detector_frame_ready_ = false;
+            release_tensor(mirrored_);
+            mirrored_ready_ = false;
+            pupil_detector_.Release();
+            face_detector_.Release();
+            return false;
+        }
         face_tracker_.reset(new FaceTracker(config.image_width,
                                             config.image_height, config));
         initialized_ = true;
+        detector_stopping_ = false;
+        try {
+            detector_thread_ = std::thread(&Impl::DetectorLoop, this);
+        } catch (const std::exception& error) {
+            fprintf(stderr, "[TrackingTask] detector thread startup failed: %s\n",
+                    error.what());
+            Release();
+            return false;
+        }
+        printf("[TrackingTask] async SCRFD worker ready\n");
         return true;
     }
 
@@ -878,42 +927,17 @@ public:
         mirror_tensor(*frame.image, mirrored_);
         const TimePoint now = Clock::now();
         state.timestamp = now;
-        face_tracker_->Predict(now);
-
         FaceDetectionResult detection;
-        const bool ran_detector = face_tracker_->ShouldRunDetector(now) &&
-                                  now >= face_detector_retry_after_;
-        if (ran_detector) {
-            detector_runs_++;
-            if (!face_detector_.Predict(&mirrored_, &detection, 0.4f)) {
-                state.face.detector_error = true;
-                detector_failures_++;
-                consecutive_detector_failures_++;
-                const int shift = std::min(5, consecutive_detector_failures_ - 1);
-                const int retry_ms = std::min(500, 10 * (1 << shift));
-                face_detector_retry_after_ = now +
-                    std::chrono::milliseconds(retry_ms);
-                fprintf(stderr,
-                        "[TrackingTask] SCRFD failure, retry_in_ms=%d streak=%d\n",
-                        retry_ms, consecutive_detector_failures_);
-            } else {
-                consecutive_detector_failures_ = 0;
-                face_detector_retry_after_ = TimePoint();
-                if (!detection.boxes.empty()) {
-                    face_tracker_->UpdateDetection(detection.boxes[0], now);
-                    face_confidence_ = detection.scores.empty()
-                        ? 1.f : detection.scores[0];
-                } else {
-                    face_tracker_->UpdateDetectionMiss(now);
-                    face_confidence_ *= 0.7f;
-                }
-            }
-        }
+        ApplyDetectorResponse(now, state, detection);
+        face_tracker_->Predict(now);
+        bool detector_scheduled = ScheduleDetectorIfNeeded(
+            mirrored_, frame.frame_id, now, state);
 
-        state.face.detector_ran = ran_detector;
         state.face.mode = face_tracker_->Mode();
         state.face.valid = face_tracker_->Valid();
         state.face.confidence = face_confidence_;
+        state.face.detector_scheduled = detector_scheduled;
+        state.face.detector_busy = DetectorBusy();
         if (!state.face.valid) {
             state.blink = blink_detector_.Update(false, 0.f);
             left_history_ = PupilObservation();
@@ -930,7 +954,7 @@ public:
         float left_y = state.face.box[1] + face_height * 0.35f;
         float right_x = state.face.box[0] + face_width * 0.70f;
         float right_y = state.face.box[1] + face_height * 0.35f;
-        if (ran_detector && detection.landmarks_per_face >= 2 &&
+        if (state.face.detector_ran && detection.landmarks_per_face >= 2 &&
             detection.landmarks.size() >= 2) {
             left_x = detection.landmarks[0][0];
             left_y = detection.landmarks[0][1];
@@ -951,8 +975,13 @@ public:
             state.frame_data_error = true;
             frame_data_failures_++;
         }
-        const bool allow_model = pupil_detector_.PreferModel() ||
-            face_tracker_->Mode() != TrackingMode::Stable;
+        const bool model_slot_ready = now >= next_pupil_model_at_ &&
+                                      !DetectorBusy();
+        const bool allow_model = model_slot_ready &&
+            config_.pupil_mode != PupilMode::Classic;
+        if (allow_model) {
+            next_pupil_model_at_ = now + std::chrono::milliseconds(33);
+        }
         if (frame_ready) {
             left = pupil_detector_.Detect(
                 state.left_eye_box,
@@ -980,6 +1009,13 @@ public:
 
             face_tracker_->UpdatePupilQuality(left, right);
             state.face.mode = face_tracker_->Mode();
+        }
+
+        if (!detector_scheduled && face_tracker_->ShouldRunDetector(now)) {
+            detector_scheduled = ScheduleDetectorIfNeeded(
+                mirrored_, frame.frame_id, now, state);
+            state.face.detector_scheduled = detector_scheduled;
+            state.face.detector_busy = DetectorBusy();
         }
 
         if (!left.valid) left_missed_++; else left_missed_ = 0;
@@ -1010,7 +1046,152 @@ public:
         return state;
     }
 
+    void ApplyDetectorResponse(TimePoint now, TrackingState& state,
+                               FaceDetectionResult& applied_detection) {
+        DetectorResponse response;
+        {
+            std::lock_guard<std::mutex> lock(detector_mutex_);
+            if (!detector_response_ready_) return;
+            response = detector_response_;
+            detector_response_ready_ = false;
+        }
+        if (response.generation != detector_generation_) return;
+
+        detector_runs_++;
+        state.face.detector_ran = true;
+        state.face.detector_latency_ms = response.latency_ms;
+        const float result_age_ms = std::chrono::duration<float, std::milli>(
+            now - response.source_time).count();
+        if (result_age_ms > 250.f) {
+            state.face.detector_error = true;
+            detector_failures_++;
+            face_detector_retry_after_ = now + std::chrono::milliseconds(10);
+            fprintf(stderr,
+                    "[TrackingTask] discard stale SCRFD result, frame=%llu "
+                    "age_ms=%.1f\n",
+                    static_cast<unsigned long long>(response.frame_id),
+                    result_age_ms);
+            return;
+        }
+        if (!response.success) {
+            state.face.detector_error = true;
+            detector_failures_++;
+            consecutive_detector_failures_++;
+            const int shift = std::min(5,
+                consecutive_detector_failures_ - 1);
+            const int retry_ms = std::min(500, 10 * (1 << shift));
+            face_detector_retry_after_ = now +
+                std::chrono::milliseconds(retry_ms);
+            fprintf(stderr,
+                    "[TrackingTask] async SCRFD failure, retry_in_ms=%d "
+                    "streak=%d\n",
+                    retry_ms, consecutive_detector_failures_);
+            return;
+        }
+
+        consecutive_detector_failures_ = 0;
+        face_detector_retry_after_ = TimePoint();
+        applied_detection = response.detection;
+        if (!applied_detection.boxes.empty()) {
+            face_tracker_->UpdateDetection(applied_detection.boxes[0], now);
+            face_confidence_ = applied_detection.scores.empty()
+                ? 1.f : applied_detection.scores[0];
+        } else {
+            face_tracker_->UpdateDetectionMiss(now);
+            face_confidence_ *= 0.7f;
+        }
+    }
+
+    bool ScheduleDetectorIfNeeded(ssne_tensor_t& image, uint64_t frame_id,
+                                  TimePoint now, TrackingState& state) {
+        if (!face_tracker_->ShouldRunDetector(now) ||
+            now < face_detector_retry_after_) return false;
+
+        {
+            std::lock_guard<std::mutex> lock(detector_mutex_);
+            if (detector_stopping_ || detector_busy_ ||
+                detector_request_ready_ || detector_response_ready_) return false;
+            if (copy_tensor_buffer(image, detector_frame_) !=
+                SSNE_ERRCODE_NO_ERROR) {
+                state.frame_data_error = true;
+                frame_data_failures_++;
+                face_detector_retry_after_ = now +
+                    std::chrono::milliseconds(10);
+                fprintf(stderr, "[TrackingTask] detector snapshot copy failed\n");
+                return false;
+            }
+            detector_request_frame_id_ = frame_id;
+            detector_request_generation_ = detector_generation_;
+            detector_request_time_ = now;
+            detector_request_ready_ = true;
+            detector_requests_++;
+        }
+        detector_cv_.notify_one();
+        return true;
+    }
+
+    bool DetectorBusy() {
+        std::lock_guard<std::mutex> lock(detector_mutex_);
+        return detector_busy_ || detector_request_ready_;
+    }
+
+    void DetectorLoop() {
+        printf("[Thread] Async SCRFD started\n");
+        while (true) {
+            uint64_t frame_id = 0;
+            uint64_t generation = 0;
+            TimePoint source_time;
+            {
+                std::unique_lock<std::mutex> lock(detector_mutex_);
+                detector_cv_.wait(lock, [this] {
+                    return detector_stopping_ || detector_request_ready_;
+                });
+                if (detector_stopping_) break;
+                frame_id = detector_request_frame_id_;
+                generation = detector_request_generation_;
+                source_time = detector_request_time_;
+                detector_request_ready_ = false;
+                detector_busy_ = true;
+            }
+
+            DetectorResponse response;
+            response.frame_id = frame_id;
+            response.generation = generation;
+            response.source_time = source_time;
+            const TimePoint started_at = Clock::now();
+            try {
+                std::lock_guard<std::mutex> npu_lock(npu_mutex_);
+                response.success = face_detector_.Predict(
+                    &detector_frame_, &response.detection, 0.4f);
+            } catch (const std::exception& error) {
+                fprintf(stderr, "[SCRFD worker] exception: %s\n", error.what());
+                response.success = false;
+            } catch (...) {
+                fprintf(stderr, "[SCRFD worker] unknown exception\n");
+                response.success = false;
+            }
+            response.latency_ms = std::chrono::duration<float, std::milli>(
+                Clock::now() - started_at).count();
+
+            {
+                std::lock_guard<std::mutex> lock(detector_mutex_);
+                detector_busy_ = false;
+                if (!detector_stopping_) {
+                    detector_response_ = response;
+                    detector_response_ready_ = true;
+                }
+            }
+        }
+        printf("[Thread] Async SCRFD stopped\n");
+    }
+
     void Reset() {
+        {
+            std::lock_guard<std::mutex> lock(detector_mutex_);
+            detector_generation_++;
+            detector_request_ready_ = false;
+            detector_response_ready_ = false;
+        }
         if (face_tracker_) face_tracker_->Reset();
         left_history_ = PupilObservation();
         right_history_ = PupilObservation();
@@ -1024,12 +1205,24 @@ public:
         blink_detector_.Reset();
         consecutive_detector_failures_ = 0;
         face_detector_retry_after_ = TimePoint();
+        next_pupil_model_at_ = TimePoint();
     }
 
     void Release() {
         if (!initialized_) return;
+        {
+            std::lock_guard<std::mutex> lock(detector_mutex_);
+            detector_stopping_ = true;
+            detector_request_ready_ = false;
+        }
+        detector_cv_.notify_all();
+        if (detector_thread_.joinable()) detector_thread_.join();
         pupil_detector_.Release();
         face_detector_.Release();
+        if (detector_frame_ready_) {
+            release_tensor(detector_frame_);
+            detector_frame_ready_ = false;
+        }
         if (mirrored_ready_) {
             release_tensor(mirrored_);
             mirrored_ready_ = false;
@@ -1061,11 +1254,29 @@ private:
     int right_missed_ = 0;
     TimePoint previous_pupil_time_ = Clock::now();
     uint64_t detector_runs_ = 0;
+    uint64_t detector_requests_ = 0;
     uint64_t model_recovery_runs_ = 0;
     uint64_t detector_failures_ = 0;
     uint64_t frame_data_failures_ = 0;
     int consecutive_detector_failures_ = 0;
     TimePoint face_detector_retry_after_;
+    TimePoint next_pupil_model_at_;
+
+    ssne_tensor_t detector_frame_;
+    bool detector_frame_ready_ = false;
+    std::thread detector_thread_;
+    std::mutex detector_mutex_;
+    std::condition_variable detector_cv_;
+    std::mutex npu_mutex_;
+    bool detector_stopping_ = false;
+    bool detector_busy_ = false;
+    bool detector_request_ready_ = false;
+    bool detector_response_ready_ = false;
+    uint64_t detector_request_frame_id_ = 0;
+    uint64_t detector_request_generation_ = 0;
+    TimePoint detector_request_time_;
+    uint64_t detector_generation_ = 0;
+    DetectorResponse detector_response_;
 };
 
 TrackingTask::TrackingTask() : impl_(new Impl()) {}

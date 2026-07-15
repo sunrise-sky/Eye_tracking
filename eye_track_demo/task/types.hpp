@@ -55,7 +55,10 @@ struct FaceState {
     float confidence = 0.f;
     TrackingMode mode = TrackingMode::Reacquire;
     bool detector_ran = false;
+    bool detector_scheduled = false;
+    bool detector_busy = false;
     bool detector_error = false;
+    float detector_latency_ms = 0.f;
     bool valid = false;
 };
 

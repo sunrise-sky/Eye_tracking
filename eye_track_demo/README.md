@@ -52,7 +52,7 @@ eye_track_demo/
 └── README.md
 ```
 
-`task` 目录中的“任务”是业务模块，不代表独立线程。当前所有模型推理仍由单一算法线程顺序执行，避免多个线程同时争用 NPU 上下文。
+`task` 目录中的“任务”主要是业务模块。逐帧算法由应用算法线程执行；SCRFD 由 `TrackingTask` 内部的低频工作线程执行。两类模型通过同一把 NPU 互斥锁串行访问设备，瞳孔模型在 SCRFD 忙碌时直接跳过并使用 classic 结果。
 
 ## 构建目标
 
@@ -128,10 +128,16 @@ flowchart TD
     L --> G
 
     F --> M[算法线程等待最新帧]
-    M --> N[TrackingTask: 人脸、眼区、瞳孔、眨眼]
+    M --> N[逐帧快路径: 人脸预测、眼区、classic瞳孔、眨眼]
     N --> O[AttentionTask: 融合、校准、预测、滤波、方向]
     O --> P[Render: 绘制人脸框、瞳孔、注视点和校准提示]
     P --> M
+
+    N --> Q{到达检测周期或质量降级}
+    Q -->|是且worker空闲| R[复制最新帧到SCRFD快照]
+    R --> S[低频SCRFD工作线程]
+    S --> T[发布检测框或错误状态]
+    T --> N
 ```
 
 ## 线程模型
@@ -151,14 +157,15 @@ flowchart TD
 
 ### 算法线程
 
-算法线程由 `InferenceLoop()` 驱动，只处理队列中的最新帧：
+应用算法线程由 `InferenceLoop()` 驱动，只处理队列中的最新帧，并保持逐帧快路径：
 
 1. 等待主线程提交 `InferenceFrame`。
 2. 响应命令标记，例如重新校准、重置、清除眨眼标记。
-3. 构造 `FramePacket` 并调用 `EyeTrackingTask::Process()`。
-4. 统计 SCRFD 调用次数、瞳孔模型恢复次数、有效 gaze 次数和延迟。
-5. 调用 `Render()` 将算法结果转换为 OSD 矩形。
-6. 归还帧池 slot。
+3. 构造 `FramePacket` 并调用 `EyeTrackingTask::Process()`，执行人脸运动预测、眼区、classic瞳孔、眨眼和 gaze。
+4. 只轮询和应用已完成的 SCRFD 结果，不等待 SCRFD 推理。
+5. 按跟踪状态请求低频重检测；worker忙碌时不排队，不阻塞快路径。
+6. 统计 SCRFD 请求/完成次数、独立检测耗时、有效 gaze 次数和快路径端到端延迟。
+7. 调用 `Render()` 将算法结果转换为 OSD 矩形并归还帧池 slot。
 
 算法队列深度为 1，帧池大小为 2。主线程入队时如果发现队列中已有旧帧，会优先移除旧帧，只保留最新帧参与算法处理。
 
@@ -232,6 +239,8 @@ FramePacket
 - `SCRFD_DEGRADED_HZ=60`
 
 当检测器返回人脸框时，`FaceTracker` 会使用平滑更新框位置和速度；当检测失败或瞳孔质量连续较差时，会退回 `DEGRADED` 或 `REACQUIRE`。
+
+SCRFD 使用独立的 640x480 快照 tensor 和工作线程。逐帧路径仅在 worker 空闲时提交一张最新快照，不建立检测积压队列。检测完成后，结果在下一次快路径迭代中应用；重置操作通过 generation 丢弃旧任务结果，结果总年龄超过 250ms 时也会被拒绝。可选瞳孔模型最多约 30Hz 尝试，且只在 SCRFD 空闲时运行，其余帧固定走 classic，避免两个模型争用 NPU并阻塞逐帧路径。
 
 #### 眼区生成
 
@@ -514,7 +523,8 @@ app_assets/models/pupil_gap.m1model
 
 ```text
 [PERF] capture_fps=... enqueue_fps=... drop=... epp_fps=...
-       gaze=... scrfd=... model_recovery=... queue=...
+       gaze=... scrfd_req=... scrfd_done=...
+       scrfd_ms_avg=... scrfd_ms_max=... model_recovery=... queue=...
        latency_ms_avg=... latency_ms_max=... mode=...
 ```
 
@@ -533,7 +543,9 @@ app_assets/models/pupil_gap.m1model
 - `drop`：最近一秒丢弃或替换的帧数。
 - `epp_fps`：算法线程完成处理的帧率。
 - `gaze`：最近一秒有效注视结果数量。
-- `scrfd`：最近一秒 SCRFD 实际调用次数。
+- `scrfd_req`：最近一秒成功提交给低频worker的SCRFD快照数量。
+- `scrfd_done`：最近一秒完成并被快路径接收的SCRFD数量。
+- `scrfd_ms_avg` / `scrfd_ms_max`：SCRFD工作线程推理平均/最大耗时，与快路径端到端延迟分开统计。
 - `model_recovery`：最近一秒瞳孔模型恢复调用次数。
 - `queue`：当前算法队列深度，设计上最大为 1。
 - `latency_ms_avg`：最近一秒算法端到端平均延迟。
@@ -546,7 +558,7 @@ app_assets/models/pupil_gap.m1model
 
 - 初始化阶段逐项校验 SSNE、模型文件、图像管线和 tensor 容量；任一步失败都会返回失败并按已完成的初始化范围释放资源。
 - 双路取帧失败时不再使用无效 tensor。连续失败 3 次后关闭并重开图像管线，重启后清空跟踪历史；失败循环采用 2–200 ms 退避，避免空转占满 CPU。
-- SCRFD 的预处理、推理和输出获取任一步失败都会立即短路，不再读取无效输出；失败后按 10–500 ms 指数退避重试，并保留上一跟踪预测，而不是误判为“无人脸”。
+- SCRFD 的预处理、推理和输出获取任一步失败都会在低频worker中立即短路，不再读取无效输出；失败后按 10–500 ms 指数退避重试，并保留上一跟踪预测，而不是阻塞快路径或误判为“无人脸”。
 - 可选瞳孔模型单次失败会回退到传统检测；连续失败 3 次后禁用模型，传统算法继续提供结果。
 - 算法线程捕获标准异常和未知异常，记录 `process_fail` 并确保帧池 slot 被归还，避免单帧故障造成线程退出或帧池耗尽。
 - `Release()` 和 `Shutdown()` 按资源就绪标记执行，可安全处理初始化中途失败和重复清理。
@@ -573,8 +585,8 @@ Commands: q=quit c=calibrate n=status r=clear marks x=reset
 
 退出时 `EyeTrackingApp::Shutdown()` 会按初始化的反序释放资源：
 
-1. 停止算法线程和输入线程。
-2. 释放 `EyeTrackingTask`。
+1. 停止应用算法线程和输入线程。
+2. 停止SCRFD worker并释放 `EyeTrackingTask`。
 3. 释放显示 tensor 和算法帧池 tensor。
 4. 关闭 `IMAGEPROCESSOR` 在线管线。
 5. 释放 `VISUALIZER` 和 OSD 资源。
@@ -586,7 +598,7 @@ Commands: q=quit c=calibrate n=status r=clear marks x=reset
 
 1. **结构清晰**：应用框架、业务任务和平台适配分离，后续替换算法或显示实现更直接。
 2. **最新帧优先**：算法队列容量为 1，旧帧会被替换，避免延迟持续累积。
-3. **多速率检测**：SCRFD 调用频率随跟踪状态变化，稳定时降低检测频率，降级或重捕时提高检测频率。
+3. **逐帧快路径 + 异步多速率检测**：SCRFD 在独立worker中运行，稳定时降低频率，降级或重捕时提高频率；逐帧算法不等待重检测。
 4. **混合瞳孔检测**：传统算法负责常规帧，模型用于低置信恢复或模型优先模式。
 5. **预测和平滑分层**：瞳孔层使用 Kalman Filter 稳定像素坐标，注意力层使用 Kalman Filter 预测 gaze，再用 One Euro Filter 做输出去抖。
 6. **校准与滤波内聚**：注视点映射、九点校准、gaze 预测和输出滤波集中在 `AttentionTask`。
