@@ -128,7 +128,7 @@ struct TrackingConfig {
     int pupil_prediction_hold_frames = 3;
     PupilMode pupil_mode = PupilMode::Hybrid;
     std::string face_model = "/app_demo/app_assets/models/face_640x480.m1model";
-    std::string pupil_model = "/app_demo/app_assets/models/pupil_gap.m1model";
+    std::string pupil_model = "/app_demo/app_assets/models/pupil_a1_opset11.m1model";
 };
 
 struct AttentionConfig {
